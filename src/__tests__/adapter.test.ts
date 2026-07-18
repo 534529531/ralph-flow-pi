@@ -28,7 +28,10 @@ import {
   defineTool,
   findSessionFile,
   piVersion,
+  replaySessionEvents,
   resolveModel,
+  truncateReplayEvents,
+  type StepEvent,
 } from "../pi/adapter.js";
 
 let tmpDir: string;
@@ -57,6 +60,18 @@ function writeSyntheticTranscript(dir: string, cwd: string): string {
     cwd,
   };
   fs.writeFileSync(file, JSON.stringify(header) + "\n");
+  return file;
+}
+
+/**
+ * A synthetic transcript with real message entries, for replaySessionEvents —
+ * parseSessionEntries is just `JSON.parse` per line (no tree/id validation), so
+ * this only needs to match the shapes replaySessionEvents actually reads.
+ */
+function writeMessageTranscript(dir: string, cwd: string, entries: any[]): string {
+  const file = writeSyntheticTranscript(dir, cwd);
+  const lines = entries.map((e, i) => JSON.stringify({ type: "message", id: `e${i}`, parentId: i === 0 ? null : `e${i - 1}`, timestamp: new Date().toISOString(), message: e }));
+  fs.appendFileSync(file, lines.join("\n") + "\n");
   return file;
 }
 
@@ -174,6 +189,73 @@ describe("session persistence", () => {
     const empty = path.join(tmpDir, "empty");
     fs.mkdirSync(empty, { recursive: true });
     expect(findSessionFile(empty)).toBeNull();
+  });
+});
+
+describe("transcript replay", () => {
+  it("converts a persisted transcript into the same StepEvent shape the live stream uses", () => {
+    const dir = path.join(tmpDir, "sessions", "impl-do-1");
+    writeMessageTranscript(dir, tmpDir, [
+      { role: "assistant", content: [
+        { type: "thinking", thinking: "let me look at the file" },
+        { type: "text", text: "Reading the file now." },
+        { type: "toolCall", id: "call1", name: "read", arguments: { file_path: "a.ts" } },
+      ], api: "x", provider: "x", model: "x", usage: {}, stopReason: "toolUse", timestamp: 0 },
+      { role: "toolResult", toolCallId: "call1", toolName: "read", content: [{ type: "text", text: "file contents" }], isError: false, timestamp: 0 },
+    ]);
+
+    const events = replaySessionEvents(dir);
+    expect(events).toEqual([
+      { type: "reasoning", delta: "let me look at the file" },
+      { type: "text", delta: "Reading the file now." },
+      { type: "tool_start", toolCallId: "call1", toolName: "read", args: { file_path: "a.ts" } },
+      { type: "tool_end", toolCallId: "call1", toolName: "read", isError: false, text: "file contents" },
+    ]);
+  });
+
+  it("skips user-role messages (the DO prompt and the engine's own continuation nudges)", () => {
+    const dir = path.join(tmpDir, "sessions", "impl-do-1");
+    writeMessageTranscript(dir, tmpDir, [
+      { role: "user", content: "do the task", timestamp: 0 },
+      { role: "assistant", content: [{ type: "text", text: "ok" }], api: "x", provider: "x", model: "x", usage: {}, stopReason: "stop", timestamp: 0 },
+      { role: "user", content: "继续", timestamp: 0 },
+    ]);
+
+    expect(replaySessionEvents(dir)).toEqual([{ type: "text", delta: "ok" }]);
+  });
+
+  it("returns an empty list for a dir with no transcript", () => {
+    expect(replaySessionEvents(path.join(tmpDir, "nope"))).toEqual([]);
+  });
+
+  describe("truncateReplayEvents", () => {
+    it("keeps everything and reports no omissions when well under budget", () => {
+      const events: StepEvent[] = [{ type: "text", delta: "hi" }, { type: "reasoning", delta: "hmm" }];
+      expect(truncateReplayEvents(events)).toEqual({ events, omitted: 0 });
+    });
+
+    it("caps by event count, keeping the most recent ones", () => {
+      const events: StepEvent[] = Array.from({ length: 600 }, (_, i) => ({ type: "text", delta: `#${i}` }));
+      const { events: kept, omitted } = truncateReplayEvents(events);
+      expect(omitted).toBe(100); // 600 - 500
+      expect(kept).toHaveLength(500);
+      expect(kept[0]).toEqual({ type: "text", delta: "#100" }); // oldest kept
+      expect(kept[kept.length - 1]).toEqual({ type: "text", delta: "#599" }); // newest
+    });
+
+    it("caps by total characters even under the event-count limit, keeping the tail", () => {
+      const big = "x".repeat(100_000);
+      const events: StepEvent[] = [
+        { type: "text", delta: big },
+        { type: "text", delta: big },
+        { type: "text", delta: big },
+        { type: "text", delta: big }, // 4 * 100k > 300k budget
+      ];
+      const { events: kept, omitted } = truncateReplayEvents(events);
+      expect(omitted).toBeGreaterThan(0);
+      expect(kept.length).toBeLessThan(events.length);
+      expect(kept[kept.length - 1]).toBe(events[events.length - 1]); // tail preserved
+    });
   });
 });
 

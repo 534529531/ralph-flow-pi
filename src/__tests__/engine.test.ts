@@ -609,6 +609,28 @@ describe("instances", () => {
     expect(r4.ok && r4.id === id1 && (r4 as any).attached === true).toBe(true);
   });
 
+  it("resolveInstance: a session owning several instances must be explicit — never silently guesses (one session, several workflows)", () => {
+    const idA = startInstance("test-wf", "a", "sess-1");
+    const idB = startInstance("test-wf", "b", "sess-1");
+
+    // No id, two owned by the same session → refused with both listed, not a
+    // "most recent" guess. Cancel/continue would otherwise risk acting on the
+    // wrong one.
+    const ambiguous = engine.resolveInstance(undefined, "sess-1");
+    expect(ambiguous.ok).toBe(false);
+    expect((ambiguous as any).text).toContain(idA);
+    expect((ambiguous as any).text).toContain(idB);
+
+    // An explicit id still resolves cleanly among them, unattached (it's ours).
+    const explicit = engine.resolveInstance(idA, "sess-1");
+    expect(explicit.ok && explicit.id === idA && explicit.attached === false).toBe(true);
+
+    // Back down to one owned instance → auto-resolves again, no id needed.
+    engine.destroyInstance(idB, "cancelled");
+    const unambiguous = engine.resolveInstance(undefined, "sess-1");
+    expect(unambiguous.ok && unambiguous.id === idA && unambiguous.attached === false).toBe(true);
+  });
+
   it("markers arm and clear", () => {
     startInstance();
     engine.writeManualStepMarker(INST);

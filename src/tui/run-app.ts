@@ -26,12 +26,13 @@ import { withInstanceLock, isInstanceGone } from "../engine/lock.js";
 import { loadSkillIndex } from "../engine/skills.js";
 import { isSubWorkflowStep, type RalphFlowState, type WorkflowDef } from "../engine/types.js";
 import {
-  applyCancelled, applyCompleted, applyGate, applyPaused, applyStalled,
+  applyCancelled, applyCompleted, applyGate, applyPaused, applyReplayNotice, applyStalled,
   applyStepEvent, applyStepStart, applyUserMessage, applyVerdict, initRunModel, primeForAttach, type RunModel,
 } from "./run-model.js";
 import { runLauncher, type LaunchChoice } from "./launcher.js";
 import { createRunView } from "./run-view.js";
 import { TUI, ProcessTerminal, initTheme } from "../pi/tui.js";
+import { replaySessionEvents, truncateReplayEvents } from "../pi/adapter.js";
 
 /** A stable owner token for this process's run. */
 function makeSessionId(): string {
@@ -187,14 +188,28 @@ export function runInstanceInTui(opts: {
     };
 
     // Structured events → the pure model → a render request. No parsing, no LLM.
+    //
+    // `runner.addEventListener` is a single shared broadcast bus — the SAME
+    // runner now commonly drives several instances at once (boot-time
+    // adoption of leftover instances, and a session deliberately running more
+    // than one workflow — see tools.ts's ralphflow_start), so every listener
+    // receives every instance's events, not just this view's. Each handler
+    // MUST check `i === instId` before touching `model`: without it, another
+    // instance's DO/CHECK stream gets applied straight into this one's model
+    // — its reasoning text bleeding into this view, its onStepStart even
+    // hijacking `model.activeStepId` outright. Purely a display bug (these
+    // reducers only ever mutate the local `model`, never engine/fs state), but
+    // a real one — confirmed via a live repro: watch instance B while
+    // instance A is still running in the background, and A's thinking text
+    // shows up in B's view.
     const events: RunnerEvents = {
-      onStepStart: (_i, sid, phase, attempt) => { applyStepStart(model, sid, phase, attempt); render(); },
-      onStepEvent: (_i, sid, phase, e) => { applyStepEvent(model, sid, phase, e); render(); },
-      onVerdict: (_i, sid, r) => { applyVerdict(model, sid, r); render(); },
-      onGate: (_i, sid) => { applyGate(model, sid); render(); bell(); },
-      onPaused: (_i, st) => { applyPaused(model, st); render(); bell(); },
-      onStalled: (_i, sid, a) => { applyStalled(model, sid, a); render(); bell(); },
-      onCompleted: (_i, rp) => { applyCompleted(model, rp); render(); bell(); },
+      onStepStart: (i, sid, phase, attempt) => { if (i !== instId) return; applyStepStart(model, sid, phase, attempt); render(); },
+      onStepEvent: (i, sid, phase, e) => { if (i !== instId) return; applyStepEvent(model, sid, phase, e); render(); },
+      onVerdict: (i, sid, r) => { if (i !== instId) return; applyVerdict(model, sid, r); render(); },
+      onGate: (i, sid) => { if (i !== instId) return; applyGate(model, sid); render(); bell(); },
+      onPaused: (i, st) => { if (i !== instId) return; applyPaused(model, st); render(); bell(); },
+      onStalled: (i, sid, a) => { if (i !== instId) return; applyStalled(model, sid, a); render(); bell(); },
+      onCompleted: (i, rp) => { if (i !== instId) return; applyCompleted(model, rp); render(); bell(); },
     };
     removeRunnerListener = runner.addEventListener(events);
 
@@ -256,7 +271,34 @@ function buildInitialModel(engine: Engine, instId: string, workflow: WorkflowDef
   if (state.paused) {
     applyPaused(model, state); // overrides activePhase back to null; keeps activeStepId/done-steps from above
   }
+  replayCurrentStepHistory(engine, model, instId, state);
   return model;
+}
+
+/**
+ * Backfill the active step's stream from its persisted transcript. Without
+ * this, primeForAttach alone leaves `streams` empty on every fresh attach
+ * (see its own doc comment) — the view shows nothing from before this attach
+ * until the next live runner event happens to arrive, even though everything
+ * that already happened is sitting on disk in the step's session dir.
+ *
+ * Only the DO phase is replayable: CHECK sessions are never given a
+ * `sessionDir` (check.ts calls them "disposable" — the verdict is what
+ * survives, not the transcript), so `listStepSessionDirs(..., "check")` is
+ * always empty and this is a no-op for an in-progress CHECK, same as today.
+ */
+function replayCurrentStepHistory(engine: Engine, model: RunModel, instId: string, state: RalphFlowState): void {
+  const stepId = state.current_step;
+  const phase = state.current_phase;
+  if (!stepId || phase !== "do") return;
+  const dirs = engine.listStepSessionDirs(instId, stepId, phase);
+  const dir = dirs[dirs.length - 1];
+  if (!dir) return;
+  const { events, omitted } = truncateReplayEvents(replaySessionEvents(dir));
+  if (omitted > 0) {
+    applyReplayNotice(model, stepId, `…已省略 ${omitted} 条更早记录，完整会话见 ${dir}`);
+  }
+  for (const event of events) applyStepEvent(model, stepId, phase, event);
 }
 
 /** Fold an attachNote'd note into whatever failure reason a resume already carries. */

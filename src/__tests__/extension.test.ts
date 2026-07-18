@@ -13,8 +13,9 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { createEngine, type Engine } from "../engine/core.js";
-import { createRalphExtension } from "../tui/extension.js";
+import { createRalphExtension, labelInstanceMessage } from "../tui/extension.js";
 import { COMMAND_PROMPTS } from "../commands/prompts.js";
+import type { InstanceInfo, RalphFlowState } from "../engine/types.js";
 
 let tmpDir: string;
 let engine: Engine;
@@ -221,5 +222,38 @@ describe("command prompts", () => {
     const text = COMMAND_PROMPTS["ralphflow-doctor"].render("x");
     expect(text).toContain("adversarial_check.agent");
     expect(text).toContain("bare name");
+  });
+});
+
+describe("labelInstanceMessage", () => {
+  function info(id: string, workflow: string): InstanceInfo {
+    const state: RalphFlowState = {
+      active: true, workflow_name: workflow, current_step: "one", current_phase: "do",
+      fail_count: 0, user_task: "t", paused: false,
+    };
+    return { id, state, owner: "sess-1", manualGate: false, doneReported: false, lastActivity: null };
+  }
+
+  it("passes the text through unchanged when only one instance is active — the common case", () => {
+    const instances = [info("a1", "spec")];
+    expect(labelInstanceMessage(instances, "a1", "📋 步骤完成，等待审查。")).toBe("📋 步骤完成，等待审查。");
+  });
+
+  it("passes the text through unchanged with no active instances at all", () => {
+    expect(labelInstanceMessage([], "a1", "hello")).toBe("hello");
+  });
+
+  it("prefixes with the workflow name and instance id once several instances are active — so concurrent gate/pause messages are attributable", () => {
+    const instances = [info("a1", "spec"), info("b2", "loop")];
+    const out = labelInstanceMessage(instances, "b2", "📋 步骤完成，等待审查。");
+    expect(out).toContain("loop");
+    expect(out).toContain("b2");
+    expect(out).toContain("📋 步骤完成，等待审查。");
+  });
+
+  it("falls back to the bare instance id if it's not in the list (e.g. destroyed between the event and the lookup)", () => {
+    const instances = [info("a1", "spec"), info("b2", "loop")];
+    const out = labelInstanceMessage(instances, "gone-3", "text");
+    expect(out).toContain("gone-3");
   });
 });

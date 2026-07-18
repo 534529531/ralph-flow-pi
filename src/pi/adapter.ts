@@ -19,6 +19,7 @@ import {
   DefaultResourceLoader,
   ModelRuntime,
   getAgentDir,
+  parseSessionEntries,
   resolveCliModel,
   SessionManager,
   SettingsManager,
@@ -327,6 +328,102 @@ export async function createCheckSession(options: Omit<CreateSessionOptions, "to
   // follow a playbook. Skills describe how to BUILD things; handing them to the
   // checker invites it to sympathize with the implementation it is grading.
   return build({ ...options, tools: READ_ONLY_TOOL_NAMES, noExtensions: true, noSkills: true });
+}
+
+// ─── Transcript replay ─────────────────────────────────────────────────────────
+//
+// Backfills the run view when it attaches to a step that was already in
+// progress (ralphflow_watch, ralphflow_continue, a fresh process adopting a
+// live instance) — see run-app.ts's buildInitialModel. The live path
+// (`normalize`, above) turns Pi's streaming deltas into StepEvents as they
+// arrive; this turns an already-complete persisted transcript into the SAME
+// StepEvent shape so the run view's existing reducer (run-model.ts's
+// applyStepEvent) can render history exactly like it renders anything else.
+// Each text/thinking block becomes one event carrying the WHOLE string (not a
+// stream of deltas) — "delta" here just means "everything at once".
+
+/**
+ * Deliberately skips user-role messages: they are either the (long) DO prompt
+ * itself or the engine's own "continue" nudges sent via session.followUp
+ * (runner.ts), neither of which the LIVE view shows either — applyUserMessage
+ * (run-model.ts) is only ever called for real human input typed into the run
+ * view, never wired to session.subscribe. Replaying them would show the
+ * engine talking to itself as if it were the user.
+ */
+export function replaySessionEvents(sessionDir: string): StepEvent[] {
+  const file = findSessionFile(sessionDir);
+  if (!file) return [];
+  let entries: any[];
+  try {
+    entries = parseSessionEntries(fs.readFileSync(file, "utf8"));
+  } catch {
+    return [];
+  }
+  const events: StepEvent[] = [];
+  for (const entry of entries) {
+    if (entry?.type !== "message") continue;
+    const msg = entry.message;
+    if (!msg || typeof msg !== "object") continue;
+    if (msg.role === "assistant") {
+      for (const c of msg.content ?? []) {
+        if (c?.type === "thinking" && typeof c.thinking === "string" && c.thinking) {
+          events.push({ type: "reasoning", delta: c.thinking });
+        } else if (c?.type === "text" && typeof c.text === "string" && c.text) {
+          events.push({ type: "text", delta: c.text });
+        } else if (c?.type === "toolCall") {
+          events.push({ type: "tool_start", toolCallId: String(c.id ?? ""), toolName: String(c.name ?? ""), args: c.arguments });
+        }
+      }
+    } else if (msg.role === "toolResult") {
+      events.push({
+        type: "tool_end",
+        toolCallId: String(msg.toolCallId ?? ""),
+        toolName: String(msg.toolName ?? ""),
+        isError: !!msg.isError,
+        text: textOf(msg.content),
+      });
+    }
+  }
+  return events;
+}
+
+/**
+ * Caps how much of a replayed transcript actually reaches the view. A step's
+ * history can in principle be arbitrarily long (many tool calls, long
+ * reasoning), and render.ts's renderStream has no windowing — it re-wraps
+ * every block on every render, including once a second while a phase is
+ * active (run-app.ts's tickTimer). Sized generously (this exists to fix
+ * "history is invisible", not to hide most of it) — it only guards the
+ * pathological long-tail case, keeping the most recent events (the ones
+ * actually relevant right after attaching) and dropping older ones.
+ */
+const REPLAY_MAX_EVENTS = 500;
+const REPLAY_MAX_CHARS = 300_000;
+
+function eventChars(e: StepEvent): number {
+  switch (e.type) {
+    case "text":
+    case "reasoning":
+      return e.delta.length;
+    case "tool_end":
+      return e.toolName.length + e.text.length;
+    case "tool_start":
+      return e.toolName.length + 100; // args are a small fixed-ish JSON blob
+    default:
+      return 0;
+  }
+}
+
+/** Keeps the tail of `events`, dropping from the front once either budget is hit. */
+export function truncateReplayEvents(events: StepEvent[]): { events: StepEvent[]; omitted: number } {
+  let chars = 0;
+  let start = 0;
+  for (let i = events.length - 1; i >= 0; i--) {
+    chars += eventChars(events[i]);
+    if (events.length - i > REPLAY_MAX_EVENTS || chars > REPLAY_MAX_CHARS) { start = i + 1; break; }
+    start = i;
+  }
+  return { events: events.slice(start), omitted: start };
 }
 
 /** The pinned Pi version, surfaced for diagnostics. */

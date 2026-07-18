@@ -198,11 +198,20 @@ describe("ralphflow_start", () => {
     expect(result.terminate).toBe(true); // fakeCtx() has no abort; must not throw
   });
 
-  it("refuses a second instance for the same session", async () => {
-    await call("ralphflow_start", { workflow: "test-wf", task: "a" });
-    const out = await call("ralphflow_start", { workflow: "test-wf", task: "b" });
-    expect(out).toContain("当前会话已有活跃工作流实例");
-    expect(engine.listInstances().length).toBe(1);
+  it("allows a second instance for the same session (one session, several workflows)", async () => {
+    const first = await call("ralphflow_start", { workflow: "test-wf", task: "a" });
+    const second = await call("ralphflow_start", { workflow: "test-wf", task: "b" });
+    expect(first).not.toContain("已有活跃工作流实例");
+    expect(second).not.toContain("已有活跃工作流实例");
+    const instances = engine.listInstances();
+    expect(instances.length).toBe(2);
+    expect(instances.every((i) => i.owner === SESSION)).toBe(true);
+  });
+
+  it("declares sequential execution — same-turn batches of start/continue/watch must not race the shared TUI", () => {
+    expect((tools.ralphflow_start as any).executionMode).toBe("sequential");
+    expect((tools.ralphflow_continue as any).executionMode).toBe("sequential");
+    expect((tools.ralphflow_watch as any).executionMode).toBe("sequential");
   });
 
   it("explains WHY an invalid workflow cannot start", async () => {
@@ -349,11 +358,26 @@ describe("ralphflow_continue", () => {
     expect(out).toContain("没有活跃的工作流");
   });
 
-  it("refuses to drive a second instance from one session", async () => {
+  it("allows taking over a second instance from one session (one session, several workflows)", async () => {
     seedInstance(); // owned by SESSION
     const other = seedInstance({ session_id: "someone-else" });
     const out = await call("ralphflow_continue", { instance: other });
-    expect(out).toContain("一个会话同时只能驱动一个实例");
+    expect(out).not.toContain("一个会话同时只能驱动一个实例");
+    expect(engine.readState(other)!.session_id).toBe(SESSION);
+    const owners = engine.listInstances().map((i) => i.owner);
+    expect(owners.every((o) => o === SESSION)).toBe(true);
+  });
+
+  it("without an id, refuses to guess which of several owned instances is meant (ambiguous — must be explicit)", async () => {
+    const a = seedInstance();
+    const b = seedInstance({ session_id: SESSION });
+    const out = await call("ralphflow_continue");
+    expect(out).toContain("同时驱动着多个实例");
+    expect(out).toContain(a);
+    expect(out).toContain(b);
+    // Neither instance was touched by the ambiguous call.
+    expect(engine.readState(a)!.current_phase).toBe("do");
+    expect(engine.readState(b)!.current_phase).toBe("do");
   });
 });
 
@@ -364,6 +388,16 @@ describe("ralphflow_cancel", () => {
     expect(out).toContain("已取消");
     expect(fs.existsSync(engine.getInstanceDir(instId))).toBe(false);
     expect(fs.readdirSync(engine.getReportsDir()).some((f) => f.startsWith(instId))).toBe(true);
+  });
+
+  it("without an id, refuses to guess which of several owned instances to destroy (never guess on a destructive action)", async () => {
+    const a = seedInstance();
+    const b = seedInstance({ session_id: SESSION });
+    const out = await call("ralphflow_cancel");
+    expect(out).toContain("同时驱动着多个实例");
+    // Neither instance was actually destroyed by the ambiguous call.
+    expect(fs.existsSync(engine.getInstanceDir(a))).toBe(true);
+    expect(fs.existsSync(engine.getInstanceDir(b))).toBe(true);
   });
 
   it("warns when another live process is driving the instance", async () => {

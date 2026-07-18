@@ -318,7 +318,15 @@ export function createTools(ctx: ToolsContext): ToolDefinition[] {
   const ralphflow_start = defineTool({
     name: "ralphflow_start",
     label: "Ralph Flow: Start",
-    description: "Start a workflow instance. Provide workflow name and task description. Multiple sessions can each run their own instance in the same project.",
+    description: "Start a workflow instance. Provide workflow name and task description. A session can run several instances at once — this does not refuse just because the session already has one active.",
+    // Same-turn batches of ralphflow_* tool calls must not overlap: attachRunView
+    // borrows the ONE shared TUI via ctx.ui.custom(), which has no reentrancy
+    // guard on pi's side. With ownership no longer capped at one instance per
+    // session, a second start/continue/watch in the same batch could otherwise
+    // race the first for that terminal. Declaring this "sequential" makes pi
+    // run the whole batch one call at a time instead of in parallel — see
+    // pi-agent-core's executeToolCallsParallel/executeToolCallsSequential.
+    executionMode: "sequential",
     parameters: Type.Object({
       workflow: Type.String({ description: "Workflow name (use ralphflow_list to see available workflows)" }),
       task: Type.String({ description: "Task description - what should be accomplished" }),
@@ -331,12 +339,7 @@ export function createTools(ctx: ToolsContext): ToolDefinition[] {
       const { workflow, task } = params;
       const extra_dirs = params.extra_dirs ?? [];
 
-      // Refuse if this session already runs an active instance.
       const instances = engine.listInstances();
-      const mine = instances.find((i) => i.owner === sessionId);
-      if (mine) {
-        return text(`当前会话已有活跃工作流实例 \`${mine.id}\`（工作流: ${mine.state.workflow_name}，步骤: ${mine.state.current_step}）。\n\n使用 /ralphflow-continue 继续，或先用 /ralphflow-cancel 取消。`);
-      }
 
       const workflowProblems: string[] = [];
       const workflowDef = engine.loadWorkflow(workflow, workflowProblems);
@@ -426,8 +429,10 @@ export function createTools(ctx: ToolsContext): ToolDefinition[] {
     name: "ralphflow_continue",
     label: "Ralph Flow: Continue",
     description: "Approve a manual review / resume a paused workflow / attach to an interrupted instance. Verification runs automatically — you do not need to trigger it. (Optional instance id, unique prefix allowed.)",
+    // See ralphflow_start's executionMode comment — same shared-TUI hazard.
+    executionMode: "sequential",
     parameters: Type.Object({
-      instance: Type.Optional(Type.String({ description: "Instance id (unique prefix allowed). Only needed to attach to a specific instance from a new session." })),
+      instance: Type.Optional(Type.String({ description: "Instance id (unique prefix allowed). Only needed to attach to a specific instance from a new session, or to pick one when this session already owns several." })),
     }),
     execute: async (_id, params, _signal, _onUpdate, ctx: UiCustomHost) => {
       const sessionId = getSessionId();
@@ -438,14 +443,6 @@ export function createTools(ctx: ToolsContext): ToolDefinition[] {
 
       const foreign = foreignDriverNote(instId);
       if (foreign) return text(foreign);
-
-      // One session drives at most one instance.
-      if (attached) {
-        const other = engine.listInstances().find((i) => i.id !== instId && i.owner === sessionId);
-        if (other) {
-          return text(`当前会话已有活跃工作流实例 \`${other.id}\`（工作流: ${other.state.workflow_name}，步骤: ${other.state.current_step}）。一个会话同时只能驱动一个实例——请先完成或取消它，或在另一个会话中接管 \`${instId}\`。`);
-        }
-      }
 
       const response = await locked(instId, () => resolveContinueAction(engine, instId, sessionId, attached));
 
@@ -469,8 +466,10 @@ export function createTools(ctx: ToolsContext): ToolDefinition[] {
     name: "ralphflow_watch",
     label: "Ralph Flow: Watch",
     description: "Attach the live run view to a workflow instance that's already running. Does not approve, resume, or cancel anything by itself. ONLY call this when the user explicitly asks to see the workflow again (\"show me\", \"let's look\", \"attach\"). Detaching (Esc) means the user chose to stop watching — do NOT call this on your own initiative just because a workflow happens to be running in the background; you'll be told in this same chat when it needs you (gate/pause) or finishes, so there's nothing to check on unprompted.",
+    // See ralphflow_start's executionMode comment — same shared-TUI hazard.
+    executionMode: "sequential",
     parameters: Type.Object({
-      instance: Type.Optional(Type.String({ description: "Instance id (unique prefix allowed). Only needed if there's more than one active instance." })),
+      instance: Type.Optional(Type.String({ description: "Instance id (unique prefix allowed). Needed whenever this session owns more than one active instance, or to watch one it doesn't own." })),
     }),
     execute: async (_id, params, _signal, _onUpdate, ctx: UiCustomHost) => {
       const sessionId = getSessionId();

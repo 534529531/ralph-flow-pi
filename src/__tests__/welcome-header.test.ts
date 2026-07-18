@@ -7,6 +7,7 @@
  * than silently dropped, and that width-wrapping doesn't crash or lose text.
  */
 
+import os from "node:os";
 import { describe, it, expect } from "vitest";
 import { Theme, visibleWidth, type ThemeColor } from "../pi/tui.js";
 import { buildWelcomeLines, type WelcomeWorkflowSummary } from "../tui/welcome-header.js";
@@ -75,6 +76,24 @@ describe("buildWelcomeLines", () => {
   it("says nothing about workflows when there are none, rather than an empty label", () => {
     const lines = buildWelcomeLines(testTheme, [], 80).map(stripAnsi);
     expect(lines.join("\n")).not.toContain("可用工作流");
+  });
+
+  it("shows the working directory when given one", () => {
+    const lines = buildWelcomeLines(testTheme, WORKFLOWS, 80, "/home/user/my-project").map(stripAnsi);
+    expect(lines.join("\n")).toContain("/home/user/my-project");
+  });
+
+  it("shortens a home-directory cwd to ~", () => {
+    const home = os.homedir();
+    const lines = buildWelcomeLines(testTheme, WORKFLOWS, 80, `${home}/projects/foo`).map(stripAnsi);
+    const joined = lines.join("\n");
+    expect(joined).toContain("~/projects/foo");
+    expect(joined).not.toContain(home);
+  });
+
+  it("omits the cwd line entirely when no cwd is given", () => {
+    const lines = buildWelcomeLines(testTheme, WORKFLOWS, 80).map(stripAnsi);
+    expect(lines.join("\n")).not.toContain("工作目录");
   });
 
   it("never emits a line wider than the given width", () => {

@@ -604,12 +604,24 @@ export function createEngine(projectDir: string, platform: Platform = {}) {
       return { ok: false, text: `前缀 "${wanted}" 匹配到 ${prefixMatches.length} 个实例，请提供更长的前缀：\n\n${formatInstanceList(prefixMatches)}` };
     }
 
-    // 2. An instance already owned by this session.
+    // 2. An instance already owned by this session — but only auto-pick when
+    //    there's exactly one. A session may now own several (see
+    //    ralphflow_start), and silently guessing "most recently active" among
+    //    them is fine for a read (status already does its own safe fallback)
+    //    but not for a mutation — ralphflow_cancel in particular would destroy
+    //    whichever one the guess got wrong. Ambiguous ownership therefore
+    //    falls through to the same "list them, make the caller be explicit"
+    //    treatment branch 3 already gives multiple UNOWNED instances.
     if (sessionId) {
       const mine = instances.filter((i) => i.owner === sessionId);
-      if (mine.length >= 1) {
-        mine.sort((a, b) => (b.lastActivity?.getTime() || 0) - (a.lastActivity?.getTime() || 0));
+      if (mine.length === 1) {
         return { ok: true, id: mine[0].id, attached: false };
+      }
+      if (mine.length > 1) {
+        return {
+          ok: false,
+          text: formatInstanceList(mine, "当前会话同时驱动着多个实例，请显式指定要操作的实例：调用工具时传入 `instance: \"<实例ID>\"`（支持唯一前缀）。"),
+        };
       }
     }
 

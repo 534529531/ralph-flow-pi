@@ -187,6 +187,13 @@ export function applyUserMessage(m: RunModel, stepId: string, text: string): Run
   return bump(m);
 }
 
+/** A one-line notice injected directly into a step's stream — used to flag that
+ *  a replayed transcript (see pi/adapter.ts's replaySessionEvents) was truncated. */
+export function applyReplayNotice(m: RunModel, stepId: string, text: string): RunModel {
+  stream(m, stepId).push({ kind: "notice", text });
+  return bump(m);
+}
+
 export function applyGate(m: RunModel, stepId: string): RunModel {
   m.status = "gate";
   m.activeStepId = stepId;

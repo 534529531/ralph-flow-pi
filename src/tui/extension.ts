@@ -22,8 +22,24 @@ import { createRunner, type Runner } from "../engine/runner.js";
 import { createTools } from "../commands/tools.js";
 import { COMMAND_PROMPTS } from "../commands/prompts.js";
 import { loadSkillIndex } from "../engine/skills.js";
-import { historyEditorFactory } from "./history-editor.js";
+import { createHistoryEditorFactory } from "./history-editor.js";
 import { createWelcomeHeaderFactory } from "./welcome-header.js";
+import type { InstanceInfo } from "../engine/types.js";
+
+/**
+ * Prefixes a runner message with which instance it's about — but only once
+ * there's more than one active instance in the project. A session can now
+ * drive several at once (see tools.ts's ralphflow_start), and the underlying
+ * gate/pause/stalled text only ever names a STEP id (runner.ts), never the
+ * workflow or instance — harmless with one instance, ambiguous with several.
+ * The common single-workflow case keeps today's plain, unlabeled text.
+ */
+export function labelInstanceMessage(instances: InstanceInfo[], instId: string, text: string): string {
+  if (instances.length <= 1) return text;
+  const info = instances.find((i) => i.id === instId);
+  const label = info ? `${info.state.workflow_name} · \`${instId}\`` : instId;
+  return `**[${label}]**\n\n${text}`;
+}
 
 /**
  * Pi's extension surface, narrowed to what this file touches.
@@ -88,8 +104,8 @@ export function createRalphExtension(engine: Engine, getSessionId: () => string)
       // print modes have no editor to replace.
       api.on("session_start", (_event, ctx) => {
         if (ctx.mode !== "tui") return;
-        ctx.ui.setEditorComponent(historyEditorFactory);
-        ctx.ui.setHeader(createWelcomeHeaderFactory(() => engine.listWorkflows()));
+        ctx.ui.setEditorComponent(createHistoryEditorFactory(engine.getRalphFlowDir()));
+        ctx.ui.setHeader(createWelcomeHeaderFactory(() => engine.listWorkflows(), engine.projectDir));
       });
 
       // Deliberately NO onStepEvent here: run-app.ts's own temporary listener
@@ -109,7 +125,7 @@ export function createRalphExtension(engine: Engine, getSessionId: () => string)
       // loses nothing for someone actually watching; it only stops narrating
       // to someone who isn't.
       runner = createRunner(engine, {
-        onMessage: (_instId, text) => post(text),
+        onMessage: (instId, text) => post(labelInstanceMessage(engine.listInstances(), instId, text)),
         onGate: () => {},        // the gate's own message comes through onMessage
         onPaused: () => {},      // ditto
         onStalled: () => {},     // ditto

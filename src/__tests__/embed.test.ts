@@ -19,6 +19,7 @@ import { createFakeTerminal, typeInto } from "./fake-terminal.js";
 import { runInstanceInTui } from "../tui/run-app.js";
 import { attachRunView, type UiCustomHost } from "../tui/embed.js";
 import { TUI, type Component } from "../pi/tui.js";
+import { CURRENT_SESSION_VERSION } from "../pi/adapter.js";
 
 let tmpDir: string;
 let engine: Engine;
@@ -172,6 +173,104 @@ describe("reattaching to a live instance", () => {
     runner.pauseAllForShutdown();
     tui.handleInput("\x1b");
     await second;
+  });
+
+  it("also replays the step's persisted transcript, not just its position (the reattach history fix)", async () => {
+    // Simulate a step that was already in progress with real conversation
+    // history on disk BEFORE this process ever attached — e.g. a crashed
+    // process's instance picked back up, or ralphflow_watch from a second
+    // terminal. Write a real transcript at the attempt-1 dir the runner would
+    // itself resume (see runner.ts's pickAttemptDir), matching what real Pi
+    // persists: a header line, then one "message" entry per turn.
+    const instId = startInstance();
+    const dir = engine.getStepSessionDir(instId, "one", "do", 1);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "2026-01-01T00-00-00-000Z_synthetic.jsonl");
+    const header = { type: "session", version: CURRENT_SESSION_VERSION, id: "synthetic", timestamp: new Date().toISOString(), cwd: tmpDir };
+    const priorTurn = {
+      type: "message", id: "m1", parentId: null, timestamp: new Date().toISOString(),
+      message: {
+        role: "assistant", api: "x", provider: "x", model: "x", usage: {}, stopReason: "stop", timestamp: 0,
+        content: [{ type: "text", text: "已经读取了配置文件，接下来修改路由。" }],
+      },
+    };
+    fs.writeFileSync(file, [JSON.stringify(header), JSON.stringify(priorTurn)].join("\n") + "\n");
+
+    const runner = createRunner(engine, {}, {
+      createSession: createFakeAdapter({ turns: [{ hangs: true }] }).createSession,
+      checkDeps: { createSession: createFakeCheckAdapter(["silent"]).createSession },
+    });
+    const tui = makeTui();
+
+    // buildInitialModel runs synchronously before the hung turn has any chance
+    // to emit anything of its own — so this content can only have come from
+    // the replayed transcript, not a live event.
+    const pending = runInstanceInTui({ engine, tui, sessionId: "sess-1", instId, runner });
+    const screen = tui.children.find((c): c is Component & { scrollBack: number } => "scrollBack" in (c as object));
+    const lines = screen!.render(100).join("\n");
+    expect(lines).toContain("已经读取了配置文件，接下来修改路由。");
+
+    runner.pauseAllForShutdown();
+    tui.handleInput("\x1b");
+    await pending;
+  });
+});
+
+describe("cross-instance isolation (one runner now commonly drives several instances)", () => {
+  it("does not bleed another instance's stream into the view you're watching", async () => {
+    // runner.addEventListener is a single shared broadcast bus (runner.ts) —
+    // every listener gets every instance's events. With one session able to
+    // run several workflows at once (ralphflow_start no longer refuses a
+    // second instance), instance A can easily still be running in the
+    // background while you ralphflow_watch instance B. Real-terminal use
+    // surfaced exactly this: A's thinking text showing up while watching B.
+    //
+    // Deliberately NOT timed with wall-clock waits around two independent
+    // ensureRunning calls — that races the fake adapter's microtask-resolved
+    // turns against a setTimeout and can pass by luck even with the bug
+    // reintroduced (verified: it did, the first time this was written). The
+    // `onStart` hook fires synchronously as A's contaminating turn begins, so
+    // attaching B from inside it deterministically puts B's listener in place
+    // BEFORE A's `emit()` for that turn runs.
+    const instA = startInstance();
+    const instB = startInstance();
+    const tui = makeTui();
+    let runner!: ReturnType<typeof createRunner>;
+    let screen: (Component & { scrollBack: number }) | undefined;
+    let pendingB: Promise<any> | undefined;
+
+    const doAdapter = createFakeAdapter({
+      turnsPerSession: [
+        [
+          {}, // instA turn 0: no-op, just keeps its loop going to a followUp
+          {
+            text: "A-ONLY-MARKER",
+            onStart: () => {
+              pendingB = runInstanceInTui({ engine, tui, sessionId: "sess-1", instId: instB, runner });
+              screen = tui.children.find((c): c is Component & { scrollBack: number } => "scrollBack" in (c as object));
+            },
+          },
+          { hangs: true }, // instA turn 2: stays "running" so it keeps broadcasting-eligible state
+        ],
+        [{ text: "B-ONLY-MARKER" }, { hangs: true }], // instB's own session, watched normally
+      ],
+    });
+    runner = createRunner(engine, {}, {
+      createSession: doAdapter.createSession,
+      checkDeps: { createSession: createFakeCheckAdapter(["silent"]).createSession },
+    });
+
+    runner.ensureRunning(instA); // background, unattached
+    await new Promise((r) => setTimeout(r, 20)); // let both sessions' microtask chains settle
+
+    expect(screen).toBeDefined();
+    const lines = screen!.render(100).join("\n");
+    expect(lines).toContain("B-ONLY-MARKER");
+    expect(lines).not.toContain("A-ONLY-MARKER");
+
+    runner.pauseAllForShutdown();
+    tui.handleInput("\x1b");
+    await pendingB;
   });
 });
 

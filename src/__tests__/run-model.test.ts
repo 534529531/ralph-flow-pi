@@ -18,7 +18,7 @@ import { createRunner, type RunnerEvents } from "../engine/runner.js";
 import { createTools } from "../commands/tools.js";
 import type { ToolDefinition, StepEvent } from "../pi/adapter.js";
 import {
-  applyCancelled, applyCompleted, applyGate, applyPaused, applyStalled, applyStepEvent, applyStepStart, applyUserMessage, applyVerdict,
+  applyCancelled, applyCompleted, applyGate, applyPaused, applyReplayNotice, applyStalled, applyStepEvent, applyStepStart, applyUserMessage, applyVerdict,
   initRunModel, needsUser, primeForAttach, progress, type RunModel,
 } from "../tui/run-model.js";
 import { createFakeAdapter, createFakeCheckAdapter, type Turn } from "./fake-adapter.js";
@@ -304,6 +304,18 @@ describe("primeForAttach", () => {
     );
     expect(m.activeStepId).toBe("one");
     expect(m.activePhase).toBeNull();
+  });
+});
+
+describe("applyReplayNotice", () => {
+  it("appends a notice block to the given step's stream and bumps revision", () => {
+    const m = model();
+    const rev = m.revision;
+    applyReplayNotice(m, "one", "…已省略 12 条更早记录，完整会话见 /tmp/x");
+    const blocks = m.streams.get("one")!;
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toEqual({ kind: "notice", text: "…已省略 12 条更早记录，完整会话见 /tmp/x" });
+    expect(m.revision).toBeGreaterThan(rev);
   });
 });
 

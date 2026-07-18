@@ -1,6 +1,6 @@
 {
   "name": "ralph-flow-pi",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DO → CHECK workflow engine on the Pi SDK — every step runs in a fresh, isolated AI session",
   "type": "module",
   "bin": {

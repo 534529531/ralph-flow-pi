@@ -19,6 +19,8 @@
  * it doesn't just look a little off.
  */
 
+import os from "node:os";
+import path from "node:path";
 import { type Component, type Theme } from "../pi/tui.js";
 import { visibleWidth, wrapTextWithAnsi } from "../pi/tui.js";
 
@@ -32,10 +34,22 @@ const MAX_LISTED = 8;
 /** Caps the box width on wide terminals — an 800px-wide slab of text reads worse than a compact card. */
 const MAX_BOX_WIDTH = 68;
 
+/** Shortens `$HOME/...` to `~/...` — same convention as the shell prompt, so it's recognizable at a glance. */
+function formatCwd(cwd: string): string {
+  const home = os.homedir();
+  if (cwd === home) return "~";
+  if (cwd.startsWith(home + path.sep)) return "~" + cwd.slice(home.length);
+  return cwd;
+}
+
 /** The unboxed content lines — colored, not yet wrapped or framed. */
-function contentLines(theme: Theme, workflows: WelcomeWorkflowSummary[]): string[] {
+function contentLines(theme: Theme, workflows: WelcomeWorkflowSummary[], cwd?: string): string[] {
   const lines: string[] = [];
   lines.push(theme.bold(theme.fg("accent", "ralph-flow")) + theme.fg("muted", "  ·  DO → CHECK 工作流引擎"));
+
+  if (cwd) {
+    lines.push(theme.fg("muted", "工作目录：") + theme.fg("text", formatCwd(cwd)));
+  }
 
   if (workflows.length > 0) {
     lines.push("");
@@ -80,8 +94,13 @@ function boxIt(theme: Theme, lines: string[], outerWidth: number): string[] {
 }
 
 /** The actual content, separated from the pi-tui plumbing so it's testable headlessly. */
-export function buildWelcomeLines(theme: Theme, workflows: WelcomeWorkflowSummary[], width: number): string[] {
-  return boxIt(theme, contentLines(theme, workflows), width);
+export function buildWelcomeLines(
+  theme: Theme,
+  workflows: WelcomeWorkflowSummary[],
+  width: number,
+  cwd?: string,
+): string[] {
+  return boxIt(theme, contentLines(theme, workflows, cwd), width);
 }
 
 /**
@@ -93,11 +112,12 @@ export function buildWelcomeLines(theme: Theme, workflows: WelcomeWorkflowSummar
  */
 export function createWelcomeHeaderFactory(
   listWorkflows: () => Array<{ name: string; desc: string; invalid?: boolean }>,
+  cwd?: string,
 ) {
   return (_tui: unknown, theme: Theme): Component => ({
     render(width: number): string[] {
       const workflows = listWorkflows().filter((w) => !w.invalid);
-      return buildWelcomeLines(theme, workflows, width);
+      return buildWelcomeLines(theme, workflows, width, cwd);
     },
     // Nothing cached — every render() call already re-lists workflows and
     // re-reads theme colors from scratch, so there's no state to drop.

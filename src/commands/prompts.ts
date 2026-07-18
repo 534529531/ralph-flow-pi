@@ -51,7 +51,7 @@ Once information is complete, call the \`ralphflow_start\` tool to start the wor
 
 **extra_dirs**: If the task's source material lives OUTSIDE the current project directory (e.g. migrating \`~/some-c-lib\` into this project), pass those directories in the optional \`extra_dirs\` parameter — the independent CHECK verifier works from the project directory and must be able to read the source material it verifies against. Each directory is validated at start; a nonexistent path refuses the start immediately. Do not guess: only pass paths the user actually mentioned.
 
-Each start creates a new **workflow instance** (the response carries its instance id). One session runs at most one instance; multiple sessions in the same project can each run their own instance in parallel. If the tool says this session already has an active instance, finish or cancel it first.
+Each start creates a new **workflow instance** (the response carries its instance id). A session can run several instances at once, and multiple sessions in the same project can each run their own too — starting a new one does NOT require finishing or cancelling an earlier one first. If you (or the user) lose track of what's running, \`ralphflow_status\`/\`ralphflow_list\` shows everything.
 
 ## How execution works
 
@@ -93,9 +93,9 @@ User input: $ARGUMENTS
 
 **Verification infrastructure failure** (⚠️ 验证未能运行): the verifier itself failed (quota/API/timeout), not the work. Nothing needs redoing and no failure was counted — once the underlying problem is fixed, \`ralphflow_continue\` re-runs the verification directly.
 
-**Attach to an interrupted instance (new session)**: If the user provided an instance id with this command, pass it as the \`instance\` argument (unique prefix allowed). Without an id:
-- a single instance in the project → auto-attached
-- multiple instances exist → the tool returns an instance list; show it to the user and ask which one to attach, then call again with \`instance\`
+**Attach to an interrupted instance (new session), or pick among several this session owns**: If the user provided an instance id with this command, pass it as the \`instance\` argument (unique prefix allowed). Without an id:
+- this session owns exactly one instance, or there's a single instance in the project → auto-attached
+- this session owns more than one, or several unowned ones exist → the tool returns an instance list instead of guessing; show it to the user and ask which one, then call again with \`instance\`
 - attaching to an instance interrupted mid-DO restarts that step; if it was interrupted after the step reported done, verification starts directly
 
 After the tool returns, the engine resumes driving on its own. Briefly tell the user what happened, then STOP. Do NOT poll ralphflow_status or read anything under .ralph-flow/ to watch progress — it renders automatically. Speak up again only for a manual review, a pause, or a user question.`),
@@ -106,7 +106,7 @@ After the tool returns, the engine resumes driving on its own. Briefly tell the 
 
 User input: $ARGUMENTS
 
-- Without arguments it attaches to this session's instance (or the single active instance in the project).
+- Without arguments it attaches to this session's instance if it owns exactly one (or the single active instance in the project). If this session owns several, or several unowned ones exist, the tool returns a list instead of guessing — show it to the user and ask which one, then call again with \`instance\`.
 - If the user named an instance, pass it as the \`instance\` argument (unique prefix allowed).
 - This does NOT approve, resume, or cancel anything by itself — it only opens the view onto whatever is already happening. If what's actually needed is approving a review or resuming a pause, use \`/ralphflow-continue\` instead.
 
@@ -119,7 +119,7 @@ After the tool returns, briefly tell the user what happened (attached and detach
 User input: $ARGUMENTS
 
 Call the \`ralphflow_status\` tool:
-- Without arguments it shows this session's instance, or an overview of ALL active instances in the project when this session has none (id, workflow, step, state, owner session, last activity).
+- Without arguments it shows this session's instance if it owns exactly one, or an overview of ALL active instances in the project when this session owns none or several (id, workflow, step, state, owner session, last activity).
 - If the user names an instance, pass it as the \`instance\` argument (unique prefix allowed) to inspect that instance.
 
 Displayed per instance:
@@ -150,8 +150,8 @@ User input: $ARGUMENTS
 
 Call the \`ralphflow_cancel\` tool to properly cancel the workflow: it aborts the running step and verification sessions, archives the final report to \`.ralph-flow/reports/\`, and removes the instance directory (including the sub-workflow state stack).
 
-- Without arguments it cancels this session's instance (or the single instance in the project).
-- To cancel a specific instance (e.g. one owned by another/closed session), pass the \`instance\` argument (unique prefix allowed). If the tool returns an instance list instead, show it to the user and confirm which one to cancel.
+- Without arguments it cancels this session's instance, but ONLY when it owns exactly one (or there's a single instance in the project) — cancelling is destructive, so the tool deliberately refuses to guess among several and returns a list instead.
+- To cancel a specific instance (e.g. one this session owns among several, or one owned by another/closed session), pass the \`instance\` argument (unique prefix allowed). If the tool returns an instance list instead, show it to the user and confirm which one to cancel — never guess on the user's behalf here.
 
 Do NOT manually delete files — use the tool to ensure proper cleanup. Artifacts produced by the workflow are kept.`),
 

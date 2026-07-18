@@ -8,21 +8,37 @@
  * keybindings, not a hand-rolled stub of the key-matching logic.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import fs from "fs";
+import path from "path";
+import os from "os";
 import { getKeybindings, type EditorTheme } from "@earendil-works/pi-tui";
 import { createFakeTerminal } from "./fake-terminal.js";
 import { TUI } from "../pi/tui.js";
-import { HistoryEditor, historyEditorFactory } from "../tui/history-editor.js";
+import { HistoryEditor, createHistoryEditorFactory } from "../tui/history-editor.js";
 
 const FAKE_THEME: EditorTheme = { borderColor: (s: string) => s, selectList: {} as EditorTheme["selectList"] };
 const UP = "\x1b[A";
 const DOWN = "\x1b[B";
 const ENTER = "\r";
 
-function makeEditor(): HistoryEditor {
+let tmpDir: string;
+let ralphFlowDir: string;
+
+beforeEach(() => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ralph-history-test-"));
+  ralphFlowDir = path.join(tmpDir, ".ralph-flow");
+});
+
+afterEach(() => {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+/** A fresh editor over a scratch `.ralph-flow/` dir — no cross-session history unless noted. */
+function makeEditor(dir: string = ralphFlowDir): HistoryEditor {
   const tui = new TUI(createFakeTerminal());
   const kb = getKeybindings();
-  return historyEditorFactory(tui, FAKE_THEME, kb);
+  return createHistoryEditorFactory(dir)(tui, FAKE_THEME, kb);
 }
 
 /** Types text character by character, then submits with the real Enter binding. */
@@ -86,5 +102,78 @@ describe("HistoryEditor", () => {
 
     editor.handleInput(UP);
     expect(editor.getText()).toBe("line one\nline two");
+  });
+});
+
+describe("HistoryEditor cross-session persistence", () => {
+  it("recalls prompts submitted in an earlier process (same project dir), not just this one", () => {
+    const first = makeEditor();
+    typeAndSubmit(first, "earlier session's message");
+
+    // A brand new editor over the SAME dir — nothing typed yet this time.
+    const second = makeEditor();
+    second.handleInput(UP);
+    expect(second.getText()).toBe("earlier session's message");
+  });
+
+  it("orders persisted entries oldest-to-newest, so the newest is recalled first", () => {
+    const first = makeEditor();
+    typeAndSubmit(first, "one");
+    typeAndSubmit(first, "two");
+    typeAndSubmit(first, "three");
+
+    const second = makeEditor();
+    second.handleInput(UP);
+    expect(second.getText()).toBe("three");
+    second.handleInput(UP);
+    expect(second.getText()).toBe("two");
+    second.handleInput(UP);
+    expect(second.getText()).toBe("one");
+  });
+
+  it("continues the same history across a third session too — not just a one-hop carryover", () => {
+    const first = makeEditor();
+    typeAndSubmit(first, "session one");
+
+    const second = makeEditor();
+    typeAndSubmit(second, "session two");
+
+    const third = makeEditor();
+    third.handleInput(UP);
+    expect(third.getText()).toBe("session two");
+    third.handleInput(UP);
+    expect(third.getText()).toBe("session one");
+  });
+
+  it("a fresh project dir with no prior history is just empty — Up is a no-op, not an error", () => {
+    const editor = makeEditor(path.join(tmpDir, "never-used", ".ralph-flow"));
+    editor.handleInput(UP);
+    expect(editor.getText()).toBe("");
+  });
+
+  it("different project dirs get independent histories", () => {
+    const projectA = path.join(tmpDir, "a", ".ralph-flow");
+    const projectB = path.join(tmpDir, "b", ".ralph-flow");
+    typeAndSubmit(makeEditor(projectA), "only in A");
+
+    const editorB = makeEditor(projectB);
+    editorB.handleInput(UP);
+    expect(editorB.getText()).toBe(""); // A's history did not leak into B
+  });
+
+  it("persists across sessions as JSONL, one prompt per line, surviving an embedded newline", () => {
+    const editor = makeEditor();
+    for (const ch of "line one\\") editor.handleInput(ch);
+    editor.handleInput(ENTER); // -> newline, not submit
+    for (const ch of "line two") editor.handleInput(ch);
+    editor.handleInput(ENTER); // real submit of "line one\nline two"
+
+    const raw = fs.readFileSync(path.join(ralphFlowDir, "history.jsonl"), "utf8").trim();
+    expect(raw.split("\n")).toHaveLength(1);
+    expect(JSON.parse(raw)).toBe("line one\nline two");
+
+    const second = makeEditor();
+    second.handleInput(UP);
+    expect(second.getText()).toBe("line one\nline two");
   });
 });
