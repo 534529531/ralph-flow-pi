@@ -1,0 +1,55 @@
+{
+  "name": "ralph-flow-pi",
+  "version": "0.1.0",
+  "description": "DO → CHECK workflow engine on the Pi SDK — every step runs in a fresh, isolated AI session",
+  "type": "module",
+  "bin": {
+    "ralphflow": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "workflows/",
+    "skills/"
+  ],
+  "keywords": [
+    "cli",
+    "ai-agent",
+    "workflow",
+    "automation",
+    "llm",
+    "coding-agent",
+    "pi-sdk",
+    "spec-driven-development"
+  ],
+  "homepage": "https://github.com/534529531/ralph-flow-pi#readme",
+  "bugs": {
+    "url": "https://github.com/534529531/ralph-flow-pi/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/534529531/ralph-flow-pi.git"
+  },
+  "author": "534529531",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.10",
+    "js-yaml": "^4.1.0",
+    "typebox": "^1.1.38"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0",
+    "vitest": "^4.1.7"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}

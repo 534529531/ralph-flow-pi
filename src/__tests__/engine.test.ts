@@ -1,0 +1,895 @@
+/**
+ * Ported near-verbatim from the opencode plugin's src/__tests__/engine.test.ts.
+ *
+ * Changes are only the ones the port forced:
+ * - paths: .opencode/ralph-flow/ → .ralph-flow/, global config home → ralph-flow-pi
+ * - prompt assertions: promise tags → report_done/verdict tool instructions
+ * - the "check result parsing" block is gone (tag parsing was replaced by tools)
+ * - the "legacy migration" block is gone (this package has no pre-2.0 layout)
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import { createEngine, type Engine } from "../engine/core.js";
+import type { Platform } from "../engine/types.js";
+
+let tmpDir: string;
+let engine: Engine;
+let INST: string; // instId of the instance created by startInstance()
+
+function makeEngine(dir = tmpDir): Engine {
+  const platform: Platform = {};
+  return createEngine(dir, platform) as Engine;
+}
+
+function projectWorkflowsDir(): string {
+  return path.join(tmpDir, ".ralph-flow", "workflows");
+}
+
+function writeProjectWorkflow(name: string, content: string): void {
+  const dir = projectWorkflowsDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${name}.yaml`), content);
+}
+
+const SIMPLE_WF = `
+description: test workflow
+steps:
+  - id: one
+    desc: first step
+    do: do one
+    check: check one
+    input: user input
+    output: "out1.md"
+    on_pass: two
+    on_fail: one
+    max_fail_count: 3
+  - id: two
+    desc: second step
+    do: do two
+    check: check two
+    input: out1.md
+    output: "out2.md"
+    on_pass: done
+    on_fail: two
+    max_fail_count: 2
+`;
+
+/** Mirror of what ralphflow_start does for a normal first step. */
+function startInstance(wfName = "test-wf", task = "test task", sessionId = "sess-1"): string {
+  const wf = engine.loadWorkflow(wfName)!;
+  const instId = engine.generateInstanceId(wfName);
+  fs.mkdirSync(engine.getInstanceDir(instId), { recursive: true });
+  engine.writeArtifactsDirName(instId, task);
+  engine.writeState({ active: true, workflow_name: wfName, current_step: wf.steps[0].id, current_phase: "do", fail_count: 0, user_task: task, paused: false, session_id: sessionId }, instId);
+  INST = instId;
+  return instId;
+}
+
+beforeEach(() => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ralph-flow-pi-test-"));
+  engine = makeEngine();
+});
+
+afterEach(() => {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+// ─── Global user workflows ───────────────────────────────────────────────────
+
+describe("global workflows", () => {
+  let globalHome: string;
+  let savedXdg: string | undefined;
+
+  function writeGlobalWorkflow(name: string, content: string): void {
+    const dir = path.join(globalHome, "ralph-flow-pi", "workflows");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${name}.yaml`), content);
+  }
+
+  beforeEach(() => {
+    globalHome = fs.mkdtempSync(path.join(os.tmpdir(), "ralph-flow-pi-xdg-"));
+    savedXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = globalHome; // getGlobalConfigHome reads this at call time
+    engine = makeEngine();
+  });
+
+  afterEach(() => {
+    if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = savedXdg;
+    fs.rmSync(globalHome, { recursive: true, force: true });
+  });
+
+  it("getGlobalWorkflowsDir points into the ralph-flow-pi config home", () => {
+    expect(engine.getGlobalWorkflowsDir()).toBe(path.join(globalHome, "ralph-flow-pi", "workflows"));
+  });
+
+  it("loads a workflow from the global dir", () => {
+    writeGlobalWorkflow("my-global", SIMPLE_WF);
+    const wf = engine.loadWorkflow("my-global");
+    expect(wf).not.toBeNull();
+    expect(wf!.steps.length).toBe(2);
+  });
+
+  it("lists global workflows alongside built-ins", () => {
+    writeGlobalWorkflow("my-global", SIMPLE_WF);
+    const names = engine.listWorkflows().map((w) => w.name);
+    expect(names).toContain("my-global");
+    expect(names).toContain("loop"); // built-in still present
+  });
+
+  it("resolution order: project shadows global shadows built-in", () => {
+    // global shadows a built-in (loop)
+    writeGlobalWorkflow("loop", SIMPLE_WF);
+    expect(engine.loadWorkflow("loop")!.description).toBe("test workflow");
+
+    // project shadows global
+    writeProjectWorkflow("loop", SIMPLE_WF.replace("test workflow", "project wins"));
+    expect(engine.loadWorkflow("loop")!.description).toBe("project wins");
+  });
+
+  it("an invalid global file falls through to the built-in", () => {
+    const builtIn = engine.loadWorkflow("loop")!.description;
+    writeGlobalWorkflow("loop", "steps: []");
+    expect(engine.loadWorkflow("loop")!.description).toBe(builtIn);
+  });
+
+  it("doctor reports the global source and its shadowing", () => {
+    writeGlobalWorkflow("loop", SIMPLE_WF); // global shadows built-in
+    const report = engine.buildDoctorReport();
+    expect(report).toContain("全局用户");
+    expect(report).toContain("~/.config/ralph-flow-pi/workflows/loop.yaml");
+    expect(report).toContain("遮蔽了同名内置");
+  });
+
+  it("ensureProjectWorkflows creates both the project and the global dir", () => {
+    engine.ensureProjectWorkflows();
+    expect(fs.existsSync(engine.getProjectWorkflowsDir())).toBe(true);
+    expect(fs.existsSync(engine.getGlobalWorkflowsDir()!)).toBe(true);
+  });
+});
+
+// ─── Workflow loading / validation ───────────────────────────────────────────
+
+describe("workflow loading", () => {
+  it("loads a valid workflow with descriptions", () => {
+    writeProjectWorkflow("test-wf", SIMPLE_WF);
+    const wf = engine.loadWorkflow("test-wf");
+    expect(wf).not.toBeNull();
+    expect(wf!.steps.length).toBe(2);
+    expect(wf!.description).toBe("test workflow");
+  });
+
+  it("rejects traversal and dotted workflow names", () => {
+    expect(engine.loadWorkflow("../evil")).toBeNull();
+    expect(engine.loadWorkflow(".hidden")).toBeNull();
+    expect(engine.loadWorkflow("a/b")).toBeNull();
+  });
+
+  it("silently skips steps missing required fields but keeps the rest", () => {
+    writeProjectWorkflow("partial", `
+steps:
+  - id: good
+    desc: ok
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: good
+    max_fail_count: 1
+  - id: bad
+    desc: missing everything else
+    on_pass: done
+    on_fail: bad
+    max_fail_count: 1
+`);
+    const problems: string[] = [];
+    const wf = engine.parseWorkflowFile(path.join(projectWorkflowsDir(), "partial.yaml"), "partial", problems);
+    expect(wf).not.toBeNull();
+    expect(wf!.steps.length).toBe(1);
+    expect(problems.some((p) => p.includes("bad"))).toBe(true);
+  });
+
+  it("collects WHY a workflow is invalid", () => {
+    writeProjectWorkflow("broken", `
+steps:
+  - id: a
+    desc: d
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: nonexistent
+    on_fail: a
+    max_fail_count: 1
+`);
+    const problems: string[] = [];
+    expect(engine.loadWorkflow("broken", problems)).toBeNull();
+    expect(problems.some((p) => p.includes("nonexistent"))).toBe(true);
+  });
+
+  it("hard-errors on duplicate step ids", () => {
+    writeProjectWorkflow("dup", `
+steps:
+  - id: a
+    desc: first
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: a
+    max_fail_count: 1
+  - id: a
+    desc: duplicate id
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: a
+    max_fail_count: 1
+`);
+    const problems: string[] = [];
+    expect(engine.loadWorkflow("dup", problems)).toBeNull();
+    expect(problems.some((p) => p.includes("重复") && p.includes("a"))).toBe(true);
+  });
+
+  it("hard-errors on manual_step referencing an unknown step", () => {
+    writeProjectWorkflow("manual-typo", `
+manual_step: [typo-step]
+steps:
+  - id: a
+    desc: d
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: a
+    max_fail_count: 1
+`);
+    const problems: string[] = [];
+    expect(engine.loadWorkflow("manual-typo", problems)).toBeNull();
+    expect(problems.some((p) => p.includes("manual_step"))).toBe(true);
+  });
+
+  it("parses manual_step in both list and comma-string form", () => {
+    writeProjectWorkflow("m1", `
+manual_step: a
+steps:
+  - id: a
+    desc: d
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: a
+    max_fail_count: 1
+`);
+    expect(engine.loadWorkflow("m1")!.manual_step).toEqual(["a"]);
+  });
+
+  it("parses adversarial_check with string model and caps timeout", () => {
+    writeProjectWorkflow("adv", `
+adversarial_check:
+  model: anthropic/claude-sonnet-4-5
+  timeout_ms: 99999999
+steps:
+  - id: a
+    desc: d
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: a
+    max_fail_count: 1
+`);
+    const wf = engine.loadWorkflow("adv")!;
+    expect(wf.adversarial_check!.model).toBe("anthropic/claude-sonnet-4-5");
+    expect(wf.adversarial_check!.timeout_ms).toBe(3600000);
+  });
+
+  it("normalizes the object model form to provider/model", () => {
+    writeProjectWorkflow("adv-obj", `
+adversarial_check:
+  model:
+    providerID: anthropic
+    modelID: claude-haiku-4-5
+steps:
+  - id: a
+    desc: d
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: a
+    max_fail_count: 1
+`);
+    expect(engine.loadWorkflow("adv-obj")!.adversarial_check!.model).toBe("anthropic/claude-haiku-4-5");
+  });
+
+  it("parses adversarial_check.extra_allowed_bash, trimmed and deduplicated", () => {
+    writeProjectWorkflow("adv-extra", `
+adversarial_check:
+  extra_allowed_bash:
+    - "./scripts/check.sh *"
+    - "  just test* "
+    - "./scripts/check.sh *"
+steps:
+  - id: a
+    desc: d
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: a
+    max_fail_count: 1
+`);
+    const wf = engine.loadWorkflow("adv-extra")!;
+    expect(wf.adversarial_check!.extra_allowed_bash).toEqual(["./scripts/check.sh *", "just test*"]);
+  });
+
+  it("project workflow shadows built-in; invalid project falls through", () => {
+    // loop is a built-in
+    const builtIn = engine.loadWorkflow("loop");
+    expect(builtIn).not.toBeNull();
+    writeProjectWorkflow("loop", SIMPLE_WF);
+    expect(engine.loadWorkflow("loop")!.description).toBe("test workflow");
+    // invalid project file → falls back to built-in
+    writeProjectWorkflow("loop", "steps: []");
+    expect(engine.loadWorkflow("loop")!.description).toBe(builtIn!.description);
+  });
+
+  it("listWorkflows flags invalid definitions instead of hiding them", () => {
+    writeProjectWorkflow("bad-only", "steps:\n  - id: x\n");
+    const list = engine.listWorkflows();
+    const bad = list.find((w) => w.name === "bad-only");
+    expect(bad).toBeDefined();
+    expect(bad!.desc).toContain("定义无效");
+  });
+
+  it("ships the built-in workflows", () => {
+    const names = engine.listWorkflows().map((w) => w.name);
+    for (const n of ["loop", "spec"]) {
+      expect(names).toContain(n);
+    }
+  });
+});
+
+// ─── Lint / doctor ────────────────────────────────────────────────────────────
+
+describe("lint and doctor", () => {
+  it("flags unreachable steps and missing done", () => {
+    writeProjectWorkflow("unreach", `
+steps:
+  - id: a
+    desc: d
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: a
+    on_fail: a
+    max_fail_count: 1
+  - id: island
+    desc: never reached
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: island
+    max_fail_count: 1
+`);
+    const raw = { steps: [] };
+    const warnings = engine.lintWorkflow(engine.loadWorkflow("unreach")!, raw);
+    expect(warnings.some((w) => w.includes("island") && w.includes("不可达"))).toBe(true);
+    expect(warnings.some((w) => w.includes("无法正常完成"))).toBe(true);
+  });
+
+  it("flags unresolvable template tokens but not {{artifacts_dir}}", () => {
+    writeProjectWorkflow("tokens", `
+steps:
+  - id: a
+    desc: d
+    do: "use {{artifacts_dir}} and {{ bad_token }}"
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: a
+    max_fail_count: 1
+`);
+    const warnings = engine.lintWorkflow(engine.loadWorkflow("tokens")!, {});
+    expect(warnings.some((w) => w.includes("bad_token"))).toBe(true);
+    expect(warnings.some((w) => w.includes("含模板变量 {{artifacts_dir}}"))).toBe(false);
+  });
+
+  it("flags broken sub-workflow references and cycles", () => {
+    writeProjectWorkflow("subref", `
+steps:
+  - id: a
+    desc: d
+    workflow: does-not-exist
+    input: i
+    output: o
+    on_pass: done
+    on_fail: a
+    max_fail_count: 1
+`);
+    const warnings = engine.lintWorkflow(engine.loadWorkflow("subref")!, {});
+    expect(warnings.some((w) => w.includes("does-not-exist"))).toBe(true);
+
+    writeProjectWorkflow("cyc-a", `
+steps:
+  - id: s
+    desc: d
+    workflow: cyc-b
+    input: i
+    output: o
+    on_pass: done
+    on_fail: s
+    max_fail_count: 1
+`);
+    writeProjectWorkflow("cyc-b", `
+steps:
+  - id: s
+    desc: d
+    workflow: cyc-a
+    input: i
+    output: o
+    on_pass: done
+    on_fail: s
+    max_fail_count: 1
+`);
+    const cycEngine = makeEngine();
+    const warnings2 = cycEngine.lintWorkflow(cycEngine.loadWorkflow("cyc-a")!, {});
+    expect(warnings2.some((w) => w.includes("成环"))).toBe(true);
+  });
+
+  it("warns that adversarial_check.agent is ignored and a bare model name won't resolve", () => {
+    writeProjectWorkflow("adv-warn", `
+adversarial_check:
+  agent: build
+  model: sonnet
+steps:
+  - id: a
+    desc: d
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: a
+    max_fail_count: 1
+`);
+    const raw = { adversarial_check: { agent: "build", model: "sonnet" } };
+    const warnings = engine.lintWorkflow(engine.loadWorkflow("adv-warn")!, raw);
+    expect(warnings.some((w) => w.includes("agent") && w.includes("忽略"))).toBe(true);
+    expect(warnings.some((w) => w.includes("裸模型名"))).toBe(true);
+  });
+
+  it("doctor warns when extra_allowed_bash asks for a permanently banned command", () => {
+    writeProjectWorkflow("adv-extra-danger", `
+adversarial_check:
+  extra_allowed_bash:
+    - "rm *"
+    - "./scripts/check.sh *"
+steps:
+  - id: a
+    desc: d
+    do: x
+    check: y
+    input: i
+    output: o
+    on_pass: done
+    on_fail: a
+    max_fail_count: 1
+`);
+    const raw = { adversarial_check: { extra_allowed_bash: ["rm *", "./scripts/check.sh *"] } };
+    const warnings = engine.lintWorkflow(engine.loadWorkflow("adv-extra-danger")!, raw);
+    expect(warnings.some((w) => w.includes("extra_allowed_bash") && w.includes("rm"))).toBe(true);
+    // The legitimate pattern alongside it must not also get flagged.
+    expect(warnings.some((w) => w.includes("check.sh"))).toBe(false);
+  });
+
+  it("doctor reports shadowing, strays, and corrupt instances", () => {
+    writeProjectWorkflow("loop", SIMPLE_WF); // shadows built-in
+    fs.writeFileSync(path.join(projectWorkflowsDir(), "notes.yaml"), "just: notes");
+    const instDir = path.join(tmpDir, ".ralph-flow", "instances", "corrupt-1");
+    fs.mkdirSync(instDir, { recursive: true });
+    fs.writeFileSync(path.join(instDir, "state.json"), "{ not json");
+    const report = engine.buildDoctorReport();
+    expect(report).toContain("遮蔽了同名内置");
+    expect(report).toContain("notes.yaml");
+    expect(report).toContain("corrupt-1");
+  });
+
+  it("doctor shouts when an invalid project file falls back to a built-in", () => {
+    writeProjectWorkflow("loop", "steps: []");
+    const report = engine.buildDoctorReport();
+    expect(report).toContain("启动的不是你这份");
+  });
+});
+
+// ─── Instance infrastructure ─────────────────────────────────────────────────
+
+describe("instances", () => {
+  beforeEach(() => writeProjectWorkflow("test-wf", SIMPLE_WF));
+
+  it("generates valid ids", () => {
+    const id = engine.generateInstanceId("Test Workflow!");
+    expect(engine.isValidInstanceId(id)).toBe(true);
+    expect(id.startsWith("test-workflow-")).toBe(true);
+  });
+
+  it("creates, lists and destroys an instance with report archive", () => {
+    const instId = startInstance();
+    const list = engine.listInstances();
+    expect(list.length).toBe(1);
+    expect(list[0].id).toBe(instId);
+    expect(list[0].owner).toBe("sess-1");
+
+    const reportPath = engine.destroyInstance(instId, "cancelled");
+    expect(reportPath).not.toBeNull();
+    expect(fs.existsSync(reportPath!)).toBe(true);
+    expect(fs.readFileSync(reportPath!, "utf-8")).toContain("已取消");
+    expect(engine.listInstances().length).toBe(0);
+    expect(fs.existsSync(engine.getInstanceDir(instId))).toBe(false);
+  });
+
+  it("destroyInstance aborts both the check and the step session", () => {
+    const aborted: string[] = [];
+    const e = createEngine(tmpDir, {
+      abortActiveCheck: (id) => aborted.push(`check:${id}`),
+      abortActiveStep: (id) => aborted.push(`step:${id}`),
+    }) as Engine;
+    const saved = engine;
+    engine = e;
+    const instId = startInstance();
+    engine.destroyInstance(instId, "cancelled");
+    expect(aborted).toEqual([`check:${instId}`, `step:${instId}`]);
+    engine = saved;
+  });
+
+  it("artifacts dir name slugs the task and survives destruction only when non-empty", () => {
+    const instId = startInstance("test-wf", "把 emoji 🚀 截断测试");
+    const artifacts = engine.getArtifactsDir(instId);
+    fs.mkdirSync(artifacts, { recursive: true });
+    fs.writeFileSync(path.join(artifacts, "out.md"), "deliverable");
+    engine.destroyInstance(instId, "completed");
+    expect(fs.existsSync(artifacts)).toBe(true); // non-empty survives
+
+    const instId2 = startInstance("test-wf", "empty artifacts");
+    const artifacts2 = engine.getArtifactsDir(instId2);
+    fs.mkdirSync(artifacts2, { recursive: true });
+    engine.destroyInstance(instId2, "completed");
+    expect(fs.existsSync(artifacts2)).toBe(false); // empty removed
+  });
+
+  it("artifacts dir name never cuts an emoji in half", () => {
+    const instId = startInstance("test-wf", "🚀".repeat(40));
+    const name = path.basename(engine.getArtifactsDir(instId));
+    expect(name.includes("�")).toBe(false);
+  });
+
+  it("resolveInstance: session-owned, explicit prefix, ambiguity, single-instance attach", () => {
+    const id1 = startInstance("test-wf", "t", "sess-1");
+    const id2 = startInstance("test-wf", "t", "sess-2");
+    expect(id1).not.toBe(id2);
+
+    // A session sees the instance it owns without an explicit id (not attached).
+    const own1 = engine.resolveInstance(undefined, "sess-1");
+    expect(own1.ok && own1.id === id1 && own1.attached === false).toBe(true);
+
+    // Explicit unique prefix resolves; from a third session it's an attach.
+    const r1 = engine.resolveInstance(id1.slice(0, id1.length - 2), "sess-3");
+    expect(r1.ok && r1.id === id1 && (r1 as any).attached === true).toBe(true);
+
+    // Ambiguous prefix rejected.
+    const r2 = engine.resolveInstance("te", "sess-3");
+    expect(r2.ok).toBe(false);
+
+    // A session that owns none, with two instances → list returned.
+    const r3 = engine.resolveInstance(undefined, "sess-3");
+    expect(r3.ok).toBe(false);
+    expect((r3 as any).text).toContain("工作流实例");
+
+    // Down to one instance → auto-attach for any session.
+    engine.destroyInstance(id2, "cancelled");
+    const r4 = engine.resolveInstance(undefined, "sess-3");
+    expect(r4.ok && r4.id === id1 && (r4 as any).attached === true).toBe(true);
+  });
+
+  it("markers arm and clear", () => {
+    startInstance();
+    engine.writeManualStepMarker(INST);
+    expect(engine.markerExists(".manual-step-active", INST)).toBe(true);
+    engine.clearManualStepMarker(INST);
+    expect(engine.markerExists(".manual-step-active", INST)).toBe(false);
+  });
+
+  it("done-reported marker round-trips (report_done tool's channel)", () => {
+    startInstance();
+    expect(engine.doneReported(INST)).toBe(false);
+    engine.writeDoneReported(INST);
+    expect(engine.doneReported(INST)).toBe(true);
+    engine.clearDoneReported(INST);
+    expect(engine.doneReported(INST)).toBe(false);
+  });
+
+  it("reinject counter increments, clears, and resets per step:phase key", () => {
+    startInstance();
+    expect(engine.readReinjectCount(INST, "one:do")).toBe(0);
+    expect(engine.incrementReinjectCount(INST, "one:do")).toBe(1);
+    expect(engine.incrementReinjectCount(INST, "one:do")).toBe(2);
+    expect(engine.readReinjectCount(INST, "one:do")).toBe(2);
+
+    // A different step (or phase) starts its own keep-alive budget.
+    expect(engine.readReinjectCount(INST, "two:do")).toBe(0);
+    expect(engine.incrementReinjectCount(INST, "two:do")).toBe(1);
+    expect(engine.readReinjectCount(INST, "one:do")).toBe(0); // superseded
+
+    engine.clearReinjectCounter(INST);
+    expect(engine.readReinjectCount(INST, "two:do")).toBe(0);
+  });
+
+  it("runner pid: own pid is not foreign, a dead pid is not foreign", () => {
+    startInstance();
+    engine.writeRunnerPid(INST);
+    expect(engine.readRunnerPid(INST)).toBe(process.pid);
+    expect(engine.foreignRunnerPid(INST)).toBeNull(); // our own pid never blocks us
+
+    // A pid that cannot be alive → treated as free.
+    engine.writeMarker(".runner-pid", "999999999", INST);
+    expect(engine.foreignRunnerPid(INST)).toBeNull();
+
+    engine.clearRunnerPid(INST);
+    expect(engine.readRunnerPid(INST)).toBeNull();
+  });
+
+  it("never resurrects a destroyed instance via marker writes", () => {
+    const instId = startInstance();
+    engine.destroyInstance(instId, "cancelled");
+    engine.writeDoPromptCache("stale", instId);
+    expect(fs.existsSync(engine.getInstanceDir(instId))).toBe(false);
+  });
+
+  it("backs up corrupted state files instead of crashing", () => {
+    const instId = startInstance();
+    fs.writeFileSync(path.join(engine.getInstanceDir(instId), "state.json"), "{ nope");
+    expect(engine.readState(instId)).toBeNull();
+    const files = fs.readdirSync(engine.getInstanceDir(instId));
+    expect(files.some((f) => f.includes("corrupted"))).toBe(true);
+  });
+});
+
+// ─── Prompts ─────────────────────────────────────────────────────────────────
+
+describe("prompts", () => {
+  beforeEach(() => writeProjectWorkflow("test-wf", SIMPLE_WF));
+
+  it("DO prompt carries task sections, artifacts dir, and caches itself", () => {
+    const instId = startInstance();
+    const wf = engine.loadWorkflow("test-wf")!;
+    const prompt = engine.buildDoPrompt(INST, wf.steps[0] as any, "my task");
+    expect(prompt).toContain("## 用户需求");
+    expect(prompt).toContain("my task");
+    expect(prompt).toContain("产出目录");
+    expect(prompt).toContain(".ralph-flow/artifacts/");
+    // Completion is a tool call now — the tag protocol is gone.
+    expect(prompt).toContain("report_done");
+    expect(prompt).not.toContain("<promise>");
+    const cached = fs.readFileSync(path.join(engine.getInstanceDir(instId), ".do-prompt-cache"), "utf-8");
+    expect(cached).toBe(prompt);
+    expect(engine.readDoPromptCache(instId)).toBe(prompt);
+  });
+
+  it("retry prompt includes failure reason and retry count", () => {
+    startInstance();
+    const wf = engine.loadWorkflow("test-wf")!;
+    const prompt = engine.buildDoPrompt(INST, wf.steps[0] as any, "t", "it broke", 2);
+    expect(prompt).toContain("上次失败原因");
+    expect(prompt).toContain("it broke");
+    expect(prompt).toContain("第 **2** 次重试");
+    expect(prompt).toContain("不要重复之前未通过的做法");
+  });
+
+  it("CHECK prompt is self-contained with verdict tool instructions", () => {
+    startInstance();
+    const wf = engine.loadWorkflow("test-wf")!;
+    const prompt = engine.buildCheckPrompt(INST, wf.steps[0] as any, "t");
+    expect(prompt).toContain("检查依据");
+    expect(prompt).toContain("verdict");
+    expect(prompt).not.toContain("<promise-check>");
+    expect(prompt).toContain("产出目录");
+  });
+
+  it("renders {{artifacts_dir}} tokens in step text", () => {
+    startInstance();
+    expect(engine.renderStepText(INST, "see {{artifacts_dir}}/x.md")).toContain(".ralph-flow/artifacts/");
+  });
+});
+
+// ─── Transitions ─────────────────────────────────────────────────────────────
+
+describe("transitions", () => {
+  beforeEach(() => writeProjectWorkflow("test-wf", SIMPLE_WF));
+
+  it("check passed advances to next step with its DO prompt", () => {
+    startInstance();
+    const wf = engine.loadWorkflow("test-wf")!;
+    const state = engine.readState(INST)!;
+    const result = engine.handleCheckPassed(INST, state, wf, wf.steps[0], { reason: "looks good" });
+    expect(result.text).toContain("检查结果：通过");
+    expect(result.text).toContain("**two**");
+    const newState = engine.readState(INST)!;
+    expect(newState.current_step).toBe("two");
+    expect(newState.current_phase).toBe("do");
+    expect(newState.fail_count).toBe(0);
+  });
+
+  it("check passed on the last step completes and destroys the instance", () => {
+    const instId = startInstance();
+    const wf = engine.loadWorkflow("test-wf")!;
+    engine.writeState({ ...engine.readState(INST)!, current_step: "two", current_phase: "check" }, INST);
+    const result = engine.handleCheckPassed(INST, engine.readState(INST)!, wf, wf.steps[1], { reason: "done" });
+    expect(result.completed).toBe(true);
+    expect(result.text).toContain("工作流完成");
+    expect(fs.existsSync(engine.getInstanceDir(instId))).toBe(false);
+    const reports = fs.readdirSync(engine.getReportsDir());
+    expect(reports.some((f) => f.startsWith(instId))).toBe(true);
+  });
+
+  it("check failed retries with reason; max failures pause", () => {
+    startInstance();
+    const wf = engine.loadWorkflow("test-wf")!;
+    let state = engine.readState(INST)!;
+    let result = engine.handleCheckFailed(INST, state, wf, wf.steps[0], { reason: "missing file" });
+    expect(result.text).toContain("失败 ✗ (1/3)");
+    expect(result.text).toContain("missing file");
+    expect(engine.readState(INST)!.fail_count).toBe(1);
+
+    engine.writeState({ ...engine.readState(INST)!, fail_count: 2 }, INST);
+    result = engine.handleCheckFailed(INST, engine.readState(INST)!, wf, wf.steps[0], { reason: "still broken" });
+    expect(result.paused).toBe(true);
+    const paused = engine.readState(INST)!;
+    expect(paused.paused).toBe(true);
+    expect(paused.pause_reason).toBe("max_failures");
+  });
+
+  it("pauses with config_error when on_pass target is missing at runtime", () => {
+    startInstance();
+    const wf = engine.loadWorkflow("test-wf")!;
+    const state = engine.readState(INST)!;
+    const fakeStep = { ...(wf.steps[0] as any), on_pass: "ghost" };
+    const result = engine.handleCheckPassed(INST, state, wf, fakeStep, { reason: "ok" });
+    expect(result.paused).toBe(true);
+    expect(engine.readState(INST)!.pause_reason).toBe("config_error");
+  });
+});
+
+// ─── Sub-workflows ───────────────────────────────────────────────────────────
+
+describe("sub-workflows", () => {
+  beforeEach(() => {
+    writeProjectWorkflow("child", `
+steps:
+  - id: c1
+    desc: child step
+    do: child work
+    check: child check
+    input: i
+    output: o
+    on_pass: done
+    on_fail: c1
+    max_fail_count: 2
+`);
+    writeProjectWorkflow("parent", `
+steps:
+  - id: p1
+    desc: parent first
+    do: parent work
+    check: parent check
+    input: i
+    output: o
+    on_pass: p2
+    on_fail: p1
+    max_fail_count: 2
+  - id: p2
+    desc: delegate
+    workflow: child
+    inputs:
+      hint: from parent
+    input: i
+    output: o
+    on_pass: done
+    on_fail: p2
+    max_fail_count: 2
+`);
+  });
+
+  it("entering a sub-workflow pushes parent and rewrites state", () => {
+    startInstance("parent");
+    const wf = engine.loadWorkflow("parent")!;
+    const result = engine.handleCheckPassed(INST, engine.readState(INST)!, wf, wf.steps[0], { reason: "ok" });
+    expect(result.text).toContain("进入子工作流");
+    expect(result.text).toContain("child work");
+    const state = engine.readState(INST)!;
+    expect(state.workflow_name).toBe("child");
+    expect(state.current_step).toBe("c1");
+    expect(state.user_task).toContain("hint: from parent");
+    expect(engine.getStackDepth(INST)).toBe(1);
+  });
+
+  it("sub-workflow completion pops back and completes the parent chain", () => {
+    const instId = startInstance("parent");
+    const parentWf = engine.loadWorkflow("parent")!;
+    engine.handleCheckPassed(INST, engine.readState(INST)!, parentWf, parentWf.steps[0], { reason: "ok" });
+    // Now inside child; child c1 passes → child done → parent p2 on_pass done → workflow completes
+    const childWf = engine.loadWorkflow("child")!;
+    const result = engine.handleCheckPassed(INST, engine.readState(INST)!, childWf, childWf.steps[0], { reason: "child ok" });
+    expect(result.completed).toBe(true);
+    expect(result.text).toContain('子工作流 "child" 已完成');
+    expect(fs.existsSync(engine.getInstanceDir(instId))).toBe(false);
+  });
+
+  it("sub-workflow max failure escalates to parent's on_fail", () => {
+    startInstance("parent");
+    const parentWf = engine.loadWorkflow("parent")!;
+    engine.handleCheckPassed(INST, engine.readState(INST)!, parentWf, parentWf.steps[0], { reason: "ok" });
+    const childWf = engine.loadWorkflow("child")!;
+    // child fails twice (max_fail_count 2) → escalate to parent p2's on_fail = p2 → re-enter child
+    engine.writeState({ ...engine.readState(INST)!, fail_count: 1 }, INST);
+    const result = engine.handleCheckFailed(INST, engine.readState(INST)!, childWf, childWf.steps[0], { reason: "child broken" });
+    const state = engine.readState(INST)!;
+    // Parent p2 on_fail is p2 (a sub-workflow step) → re-enters child fresh
+    expect(state.workflow_name).toBe("child");
+    expect(state.current_step).toBe("c1");
+    expect(result.text).toContain("失败");
+  });
+
+  it("nesting depth is capped", () => {
+    startInstance("parent");
+    for (let i = 0; i < 5; i++) {
+      engine.pushState(engine.readState(INST)!, INST);
+    }
+    const wf = engine.loadWorkflow("parent")!;
+    const result = engine.resolveSubWorkflowEntry(INST, "child", "t", wf.steps[1] as any);
+    expect(result.error).toBe(true);
+    expect(result.text).toContain("嵌套深度");
+  });
+});
+
+// ─── State stack robustness ──────────────────────────────────────────────────
+
+describe("state stack", () => {
+  beforeEach(() => writeProjectWorkflow("test-wf", SIMPLE_WF));
+
+  it("push/pop round-trips and empty pop returns null", () => {
+    startInstance();
+    const s = engine.readState(INST)!;
+    engine.pushState(s, INST);
+    engine.pushState({ ...s, current_step: "two" }, INST);
+    expect(engine.getStackDepth(INST)).toBe(2);
+    expect(engine.popState(INST)!.current_step).toBe("two");
+    expect(engine.popState(INST)!.current_step).toBe("one");
+    expect(engine.popState(INST)).toBeNull();
+  });
+
+  it("recovers from a corrupted stack file", () => {
+    const instId = startInstance();
+    fs.writeFileSync(path.join(engine.getInstanceDir(instId), "state-stack.json"), "[ nope");
+    expect(engine.popState(INST)).toBeNull();
+    engine.pushState(engine.readState(INST)!, INST);
+    expect(engine.getStackDepth(INST)).toBe(1);
+  });
+});

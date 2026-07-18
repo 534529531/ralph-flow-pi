@@ -1,0 +1,1984 @@
+/**
+ * Ralph Flow engine core — the host-independent semantic core.
+ *
+ * The WORKFLOW LOGIC (YAML schema + validation, prompt building, the
+ * check-result state machine, the sub-workflow stack, lint/doctor, reports)
+ * is a verbatim mirror of the opencode plugin's engine.ts so existing user
+ * workflows keep running unchanged; see SYNC.md for the mirror boundary.
+ *
+ * The RUNTIME PLUMBING is NOT a mirror. ralph-flow-pi owns its sessions: the
+ * engine creates a fresh AgentSession per DO step instead of borrowing a host
+ * chat session. Three consequences show up in this file:
+ *
+ * - Completion signalling is structured. The opencode/Claude versions asked the
+ *   model to emit `<promise>done</promise>` / `<promise-check>true</promise-check>`
+ *   and parsed the text back out. Here the DO session gets a `report_done` tool
+ *   and the CHECK session a `verdict` tool, so the tag-parsing helpers (and
+ *   their last-line/100-char/code-fence tolerance rules) are gone.
+ * - The driver's idle-dedup markers (.last-phase-report/.post-tool-active) are
+ *   gone with the idle event that needed them; the runner awaits turns directly.
+ * - Data lives under `.ralph-flow/` (no host dir), and there is no pre-2.0
+ *   legacy layout to migrate — this package starts fresh.
+ */
+
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import yaml from "js-yaml";
+import { validateExtraAllowedBash } from "./check-bash.js";
+import {
+  type AdversarialCheckConfig,
+  type InstanceInfo,
+  type NormalStepDef,
+  type PermissionAction,
+  type Platform,
+  type RalphFlowState,
+  type StepDef,
+  type StepExecutionRecord,
+  type SubWorkflowStepDef,
+  type TransitionResult,
+  type WorkflowDef,
+  isSubWorkflowStep,
+  stripBom,
+} from "./types.js";
+
+export * from "./types.js";
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/** Project-relative data root. Unlike the plugin versions this is not nested
+ *  under a host's config dir (.opencode/ / .claude/) — we are the host. */
+export const RALPH_FLOW_DIRNAME = ".ralph-flow";
+/** Global config home basename under ~/.config. */
+export const GLOBAL_CONFIG_DIRNAME = "ralph-flow-pi";
+
+const INSTANCES_DIRNAME = "instances";
+const REPORTS_DIRNAME = "reports";
+const STATE_FILENAME = "state.json";
+const STACK_FILENAME = "state-stack.json";
+// Mirrors the Claude version's .adversarial-pid / opencode's .adversarial-session:
+// holds the CHECK session's JSONL path so a cross-process cancel can find it.
+const ADVERSARIAL_SESSION_FILENAME = ".adversarial-session";
+export const MANUAL_STEP_MARKER = ".manual-step-active";
+export const MANUAL_GATE_MARKER = ".manual-gate";
+/** Written by the DO session's `report_done` tool (was .done-tag-detected, set
+ *  by text-tag detection). */
+export const DONE_REPORTED_MARKER = ".done-reported";
+export const REINJECT_COUNT_MARKER = ".do-reinject-count";
+export const DO_PROMPT_CACHE_MARKER = ".do-prompt-cache";
+/** PID of the process currently driving this instance's runner loop. */
+export const RUNNER_PID_MARKER = ".runner-pid";
+const MAX_STEP_RECORDS = 1000;
+export const MAX_NESTING_DEPTH = 5;
+const MAX_WORKFLOW_FILE_SIZE = 1024 * 1024; // 1 MB
+export const MAX_ADVERSARIAL_TIMEOUT_MS = 3_600_000; // 1 hour
+
+const isWin = process.platform === "win32";
+
+export interface Engine extends ReturnType<typeof createEngine> {}
+
+export function createEngine(projectDir: string, platform: Platform = {}) {
+  // The runner is built on top of the engine (it needs readState, the prompts,
+  // the transitions), so its abort handle can only be wired in afterwards —
+  // hence a setter rather than a constructor argument.
+  function setAbortActiveStep(fn: (instId: string) => void): void {
+    platform = { ...platform, abortActiveStep: fn };
+  }
+
+  // ─── Atomic File I/O ────────────────────────────────────────────────────────
+
+  function atomicWriteJson(filePath: string, data: unknown): void {
+    atomicWriteText(filePath, JSON.stringify(data, null, 2));
+  }
+
+  function atomicWriteText(filePath: string, text: string): void {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const tmp = filePath + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, text);
+    try {
+      fs.renameSync(tmp, filePath);
+    } catch (e: any) {
+      // Windows can throw EPERM/EEXIST when renaming over an existing file that
+      // is momentarily open (antivirus, indexer). Retry once after a short spin.
+      if (isWin && (e.code === "EPERM" || e.code === "EEXIST" || e.code === "EACCES")) {
+        try { fs.unlinkSync(filePath); } catch {}
+        fs.renameSync(tmp, filePath);
+      } else {
+        try { fs.unlinkSync(tmp); } catch {}
+        throw e;
+      }
+    }
+  }
+
+  // ─── Instance Infrastructure ────────────────────────────────────────────────
+
+  function getRalphFlowDir(): string {
+    return path.join(projectDir, RALPH_FLOW_DIRNAME);
+  }
+
+  // Diagnostic sink. Every user-facing problem is already surfaced through the
+  // `problems` array / tool responses, so nothing important is hidden here. It
+  // must stay a file: the TUI owns the terminal, so any stray console write
+  // corrupts the display.
+  function diag(...args: unknown[]): void {
+    try {
+      const dir = path.join(getRalphFlowDir(), "logs");
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.appendFileSync(
+        path.join(dir, "engine-diag.log"),
+        `[${new Date().toISOString()}] ${args.map((a) => (a instanceof Error ? a.message : String(a))).join(" ")}\n`
+      );
+    } catch {}
+  }
+
+  function getInstancesRoot(): string {
+    return path.join(getRalphFlowDir(), INSTANCES_DIRNAME);
+  }
+
+  function getReportsDir(): string {
+    return path.join(getRalphFlowDir(), REPORTS_DIRNAME);
+  }
+
+  // Per-instance artifacts directory. Lives OUTSIDE instances/<id>/ because the
+  // instance dir is deleted on completion/cancel (destroyInstance) — artifacts
+  // are workflow deliverables that must survive the workflow and stay isolated
+  // between parallel instances.
+  const ARTIFACTS_DIRNAME = "artifacts";
+  const ARTIFACTS_NAME_FILENAME = "artifacts-dir";
+
+  // OpenSpec-style human-readable dir name: short task summary + instance-id
+  // suffix so parallel instances of the same task never collide.
+  function makeArtifactsDirName(task: string, instId: string): string {
+    // Truncate by code point (Array.from), not UTF-16 unit: a plain slice() can
+    // cut an emoji in half, leaving a lone surrogate that round-trips through
+    // the utf-8 name file as U+FFFD — the prompt and the file would then name
+    // two different directories. Dash-trim runs after the cut for the same
+    // reason (the cut itself can expose a trailing dash).
+    const slug = Array.from(
+      String(task || "").trim()
+        .replace(/\s+/g, "-")
+        .replace(/[\\/:*?"'`<>|.$&(){}[\];!#~^]/g, "")
+    ).slice(0, 30).join("").replace(/^-+|-+$/g, "");
+    const suffix = String(instId).split("-").pop() || "0";
+    return slug ? `${slug}-${suffix}` : String(instId);
+  }
+
+  // The name is fixed at workflow start and read back from the instance dir —
+  // sub-workflow pushes rewrite state.json (including user_task), so the name
+  // cannot be re-derived from state later.
+  function writeArtifactsDirName(instId: string, task: string): void {
+    atomicWriteText(instPath(ARTIFACTS_NAME_FILENAME, instId), makeArtifactsDirName(task, instId));
+  }
+
+  function getArtifactsDirName(instId: string): string {
+    try {
+      const v = stripBom(fs.readFileSync(instPath(ARTIFACTS_NAME_FILENAME, instId), "utf-8")).trim();
+      // A hand-edited name file must not be able to walk out of the artifacts
+      // root (this path is joined and later mkdir'd/rmdir'd).
+      if (v && !v.includes("/") && !v.includes("\\") && !v.includes("..")) return v;
+    } catch {}
+    return reqInst(instId);
+  }
+
+  function getArtifactsDir(instId: string): string {
+    return path.join(getRalphFlowDir(), ARTIFACTS_DIRNAME, getArtifactsDirName(instId));
+  }
+
+  // Project-relative form with forward slashes, embeddable in DO/CHECK prompts
+  // (both the step session and the adversarial checker run with cwd = projectDir).
+  function getArtifactsRelDir(instId: string): string {
+    return `${RALPH_FLOW_DIRNAME}/${ARTIFACTS_DIRNAME}/${getArtifactsDirName(instId)}`;
+  }
+
+  // Internal escape hatch only: {{artifacts_dir}} in step text still resolves,
+  // but workflow authors never need it — every DO/CHECK prompt carries a 产出目录
+  // section pointing at the same path.
+  const ARTIFACTS_TOKEN = "{{artifacts_dir}}";
+
+  function renderStepText(instId: string, text: string): string {
+    if (typeof text !== "string" || !text.includes(ARTIFACTS_TOKEN)) return text;
+    return text.split(ARTIFACTS_TOKEN).join(getArtifactsRelDir(instId));
+  }
+
+  // Extra read-access dirs for the adversarial checker, declared explicitly at
+  // ralphflow_start for tasks whose source material lives outside the project
+  // dir. Stored as an instance file so sub-workflow state pushes can't drop them.
+  const EXTRA_DIRS_FILENAME = "extra-dirs";
+
+  function writeExtraDirs(instId: string, dirs: string[]): void {
+    if (Array.isArray(dirs) && dirs.length > 0) {
+      atomicWriteJson(instPath(EXTRA_DIRS_FILENAME, instId), dirs);
+    }
+  }
+
+  function readExtraDirs(instId: string): string[] {
+    try {
+      const v = JSON.parse(stripBom(fs.readFileSync(instPath(EXTRA_DIRS_FILENAME, instId), "utf-8")));
+      if (Array.isArray(v)) return v.filter((d) => typeof d === "string");
+    } catch {}
+    return [];
+  }
+
+  function getInstanceDir(instId: string): string {
+    return path.join(getInstancesRoot(), instId);
+  }
+
+  /** Every instance-scoped helper requires an explicit instId. */
+  function reqInst(instId: string): string {
+    if (!instId) throw new Error("instId is required");
+    return instId;
+  }
+
+  function instPath(name: string, instId: string): string {
+    return path.join(getInstanceDir(reqInst(instId)), name);
+  }
+
+  function isValidInstanceId(id: unknown): id is string {
+    return typeof id === "string" && /^[a-z0-9][a-z0-9-]{0,80}$/.test(id);
+  }
+
+  function generateInstanceId(workflowName: string): string {
+    const base = String(workflowName).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "wf";
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const ts = `${String(d.getFullYear()).slice(2)}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    const rand = Math.random().toString(36).slice(2, 6).padEnd(4, "0");
+    return `${base}-${ts}-${rand}`;
+  }
+
+  // ─── Step session dirs (owned by the runner; path knowledge lives here) ─────
+  //
+  // One DIRECTORY per step attempt, not one file: pi derives its own transcript
+  // filename (`<timestamp>_<id>.jsonl`) and offers no way to dictate it, so the
+  // directory is the unit we can address. The runner resumes an attempt by
+  // handing pi the same dir back.
+
+  const SESSIONS_DIRNAME = "sessions";
+
+  function getSessionsDir(instId: string): string {
+    return path.join(getInstanceDir(reqInst(instId)), SESSIONS_DIRNAME);
+  }
+
+  function stepSlug(stepId: string): string {
+    return String(stepId).replace(/[^a-zA-Z0-9._-]/g, "_");
+  }
+
+  /** Session dir for one attempt of one step phase. */
+  function getStepSessionDir(instId: string, stepId: string, phase: "do" | "check", attempt: number): string {
+    return path.join(getSessionsDir(instId), `${stepSlug(stepId)}-${phase}-${attempt}`);
+  }
+
+  /** Existing attempt dirs for a step phase, oldest first. */
+  function listStepSessionDirs(instId: string, stepId: string, phase: "do" | "check"): string[] {
+    const root = getSessionsDir(instId);
+    const prefix = `${stepSlug(stepId)}-${phase}-`;
+    try {
+      return fs.readdirSync(root, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && e.name.startsWith(prefix))
+        .map((e) => ({ name: e.name, n: parseInt(e.name.slice(prefix.length), 10) }))
+        .filter((e) => Number.isInteger(e.n))
+        .sort((a, b) => a.n - b.n)
+        .map((e) => path.join(root, e.name));
+    } catch {
+      return [];
+    }
+  }
+
+  /** The owning session id is stored in the instance's state.json. */
+  function readOwnerSession(instId: string): string | null {
+    const s = readState(instId);
+    return s?.session_id || null;
+  }
+
+  /** Claim ownership by writing session_id into the state (no-op if gone). */
+  function claimOwnership(instId: string, sessionId: string | null): void {
+    if (!sessionId) return;
+    const s = readState(instId);
+    if (!s || !s.active) return;
+    if (s.session_id === sessionId) return;
+    writeState({ ...s, session_id: sessionId }, instId);
+    clearMarker(".orphan-notified", instId);
+  }
+
+  // ─── Runner pid (cross-process double-drive guard) ──────────────────────────
+
+  function writeRunnerPid(instId: string): void {
+    writeMarker(RUNNER_PID_MARKER, String(process.pid), instId);
+  }
+
+  function clearRunnerPid(instId: string): void {
+    clearMarker(RUNNER_PID_MARKER, instId);
+  }
+
+  function readRunnerPid(instId: string): number | null {
+    try {
+      const v = stripBom(fs.readFileSync(instPath(RUNNER_PID_MARKER, instId), "utf-8")).trim();
+      const pid = parseInt(v, 10);
+      return Number.isInteger(pid) && pid > 0 ? pid : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Is another live process driving this instance? Our own pid never counts. */
+  function foreignRunnerPid(instId: string): number | null {
+    const pid = readRunnerPid(instId);
+    if (pid === null || pid === process.pid) return null;
+    return isPidAlive(pid) ? pid : null;
+  }
+
+  // ─── State Management (per instance) ────────────────────────────────────────
+
+  function getStateFile(instId: string): string {
+    return instPath(STATE_FILENAME, instId);
+  }
+
+  /**
+   * A live instance is one whose state.json still exists. Writers below check
+   * this before writing so no code path can resurrect a destroyed instance
+   * directory (e.g. a cross-session cancel racing an in-flight check).
+   */
+  function instanceExists(instId: string): boolean {
+    try {
+      return fs.existsSync(getStateFile(instId));
+    } catch {
+      return false;
+    }
+  }
+
+  function isValidState(s: any): s is RalphFlowState {
+    return s && typeof s === "object"
+      && typeof s.active === "boolean"
+      && typeof s.workflow_name === "string" && s.workflow_name.length > 0
+      && typeof s.current_step === "string" && s.current_step.length > 0
+      && typeof s.current_phase === "string"
+      && typeof s.fail_count === "number" && s.fail_count >= 0
+      && typeof s.paused === "boolean"
+      && (s.pause_reason === undefined || s.pause_reason === null || typeof s.pause_reason === "string");
+  }
+
+  function readState(instId: string): RalphFlowState | null {
+    try {
+      const stateFile = getStateFile(instId);
+      if (fs.existsSync(stateFile)) {
+        try {
+          const parsed = JSON.parse(stripBom(fs.readFileSync(stateFile, "utf-8")));
+          if (!isValidState(parsed)) {
+            diag("[ralph-flow] State file has invalid schema, backing up");
+            try { fs.renameSync(stateFile, stateFile + ".invalid." + Date.now()); } catch {}
+            return null;
+          }
+          return parsed;
+        } catch (parseErr: any) {
+          diag("[ralph-flow] State file corrupted, backing up:", parseErr.message);
+          try { fs.renameSync(stateFile, stateFile + ".corrupted." + Date.now()); } catch {}
+          return null;
+        }
+      }
+    } catch (e: any) {
+      diag("[ralph-flow] Error reading state:", e.message);
+    }
+    return null;
+  }
+
+  function writeState(state: RalphFlowState, instId: string): void {
+    try {
+      const id = reqInst(instId);
+      // Preserve the owning session_id when the caller's state object omits the
+      // key entirely. Pure-logic transitions (sub-workflow entry, check routing)
+      // build fresh state objects without session_id; without this they would
+      // orphan the instance. An explicit session_id (even null, to clear
+      // ownership) still wins.
+      const session_id = Object.prototype.hasOwnProperty.call(state, "session_id")
+        ? state.session_id
+        : readState(id)?.session_id;
+      atomicWriteJson(getStateFile(id), { ...state, session_id, instance_id: id });
+    } catch (e: any) {
+      diag("[ralph-flow] Error writing state:", e.message);
+    }
+  }
+
+  function writeMarker(name: string, content: string, instId: string): void {
+    try {
+      const id = reqInst(instId);
+      if (!instanceExists(id)) return; // never resurrect a destroyed instance
+      fs.writeFileSync(path.join(getInstanceDir(id), name), content);
+    } catch {}
+  }
+
+  function clearMarker(name: string, instId: string): void {
+    try {
+      const marker = instPath(name, instId);
+      if (fs.existsSync(marker)) fs.unlinkSync(marker);
+    } catch {}
+  }
+
+  function markerExists(name: string, instId: string): boolean {
+    try {
+      return fs.existsSync(instPath(name, instId));
+    } catch {
+      return false;
+    }
+  }
+
+  function writeManualStepMarker(instId: string): void { writeMarker(MANUAL_STEP_MARKER, "active", instId); }
+  function clearManualStepMarker(instId: string): void { clearMarker(MANUAL_STEP_MARKER, instId); }
+  function writeManualGate(instId: string): void { writeMarker(MANUAL_GATE_MARKER, "waiting", instId); }
+  function clearManualGate(instId: string): void { clearMarker(MANUAL_GATE_MARKER, instId); }
+  function clearReinjectCounter(instId: string): void { clearMarker(REINJECT_COUNT_MARKER, instId); }
+  function clearDoPromptCache(instId: string): void { clearMarker(DO_PROMPT_CACHE_MARKER, instId); }
+
+  /** Set by the DO session's `report_done` tool. */
+  function writeDoneReported(instId: string): void { writeMarker(DONE_REPORTED_MARKER, "done", instId); }
+  function clearDoneReported(instId: string): void { clearMarker(DONE_REPORTED_MARKER, instId); }
+  function doneReported(instId: string): boolean { return markerExists(DONE_REPORTED_MARKER, instId); }
+
+  // The counter is keyed by "<step>:<phase>" exactly as the driver's was: moving
+  // to another step or phase must start the keep-alive budget over, and keying
+  // the file rather than clearing it on every transition means no transition can
+  // forget to.
+  function readReinjectCount(instId: string, key: string): number {
+    try {
+      const content = stripBom(fs.readFileSync(instPath(REINJECT_COUNT_MARKER, instId), "utf-8")).trim();
+      const [storedKey, storedCount] = content.split(" ");
+      if (storedKey !== key) return 0;
+      const v = parseInt(storedCount, 10);
+      return Number.isInteger(v) && v >= 0 ? v : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function incrementReinjectCount(instId: string, key: string): number {
+    const next = readReinjectCount(instId, key) + 1;
+    writeMarker(REINJECT_COUNT_MARKER, `${key} ${next}`, instId);
+    return next;
+  }
+
+  function writeDoPromptCache(prompt: string, instId: string): void {
+    try {
+      const id = reqInst(instId);
+      if (!instanceExists(id)) return;
+      atomicWriteText(instPath(DO_PROMPT_CACHE_MARKER, id), prompt);
+    } catch {}
+  }
+
+  function readDoPromptCache(instId: string): string | null {
+    try {
+      const v = stripBom(fs.readFileSync(instPath(DO_PROMPT_CACHE_MARKER, instId), "utf-8"));
+      return v || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ─── Adversarial-check session file (cross-process cancel support) ──────────
+
+  function writeAdversarialSession(checkSessionRef: string, instId: string): void {
+    try {
+      const id = reqInst(instId);
+      if (!instanceExists(id)) return;
+      atomicWriteText(instPath(ADVERSARIAL_SESSION_FILENAME, id), String(checkSessionRef));
+    } catch {}
+  }
+
+  function clearAdversarialSession(instId: string): void {
+    clearMarker(ADVERSARIAL_SESSION_FILENAME, instId);
+  }
+
+  function readAdversarialSession(instId: string): string | null {
+    try {
+      const v = stripBom(fs.readFileSync(instPath(ADVERSARIAL_SESSION_FILENAME, instId), "utf-8")).trim();
+      return v || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ─── Instance listing / resolution ──────────────────────────────────────────
+
+  function listInstances(): InstanceInfo[] {
+    const result: InstanceInfo[] = [];
+    const root = getInstancesRoot();
+    if (!fs.existsSync(root)) return result;
+    let entries;
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      return result;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const id = entry.name;
+      if (!isValidInstanceId(id)) continue;
+      const state = readState(id);
+      if (!state || !state.active) continue;
+      let lastActivity: Date | null = null;
+      try { lastActivity = fs.statSync(getStateFile(id)).mtime; } catch {}
+      result.push({
+        id,
+        state,
+        owner: state.session_id || null,
+        manualGate: markerExists(MANUAL_GATE_MARKER, id),
+        doneReported: markerExists(DONE_REPORTED_MARKER, id),
+        lastActivity,
+      });
+    }
+    return result;
+  }
+
+  function instanceStatusLabel(info: InstanceInfo): string {
+    const s = info.state;
+    if (s.paused) {
+      if (s.pause_reason === "max_failures") return "⏸ 已暂停（达到最大失败次数）";
+      if (s.pause_reason === "config_error") return "⏸ 已暂停（工作流配置错误）";
+      if (s.pause_reason === "check_error") return "⏸ 已暂停（验证未能运行，continue 重新验证）";
+      if (s.pause_reason === "session_aborted") return "⏸ 已暂停（会话中断，continue 恢复）";
+      return `⏸ 已暂停（${s.pause_reason || "未知原因"}）`;
+    }
+    if (s.current_phase === "check") return "🔍 验证中";
+    if (info.manualGate) return "⏸ 等待手动审查";
+    if (info.doneReported) return "✅ DO 完成，待验证";
+    return "🔨 执行中";
+  }
+
+  function formatLastActivity(date: Date | null): string {
+    if (!date) return "未知";
+    const diffMs = Date.now() - date.getTime();
+    const mins = Math.floor(diffMs / 60000);
+    if (mins < 1) return "刚刚";
+    if (mins < 60) return `${mins} 分钟前`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours} 小时前`;
+    return `${Math.floor(hours / 24)} 天前`;
+  }
+
+  function formatInstanceList(instances: InstanceInfo[], actionHint?: string): string {
+    const lines = [`## 工作流实例（${instances.length} 个）`, ""];
+    for (const info of instances) {
+      const task = (info.state.user_task || "").replace(/\s+/g, " ").slice(0, 60);
+      lines.push(`### \`${info.id}\``);
+      lines.push(`- **工作流**: ${info.state.workflow_name}`);
+      if (task) lines.push(`- **任务**: ${task}${(info.state.user_task || "").length > 60 ? "…" : ""}`);
+      lines.push(`- **步骤**: ${info.state.current_step}（${info.state.current_phase}）`);
+      lines.push(`- **状态**: ${instanceStatusLabel(info)}`);
+      lines.push(`- **属主会话**: ${info.owner ? `\`${info.owner.slice(0, 8)}\`` : "无"}`);
+      lines.push(`- **最后活动**: ${formatLastActivity(info.lastActivity)}`);
+      lines.push("");
+    }
+    if (actionHint) lines.push(actionHint);
+    return lines.join("\n");
+  }
+
+  type Resolution = { ok: true; id: string; attached: boolean } | { ok: false; text: string };
+
+  /**
+   * Resolve which instance a tool call from `sessionId` targets.
+   * `attached` is true when the call takes over an instance owned by a
+   * different (or no) session — the caller uses it to pick attach semantics.
+   * Ownership is advisory: takeover is always allowed (explicitly, or
+   * implicitly when a single instance exists). The hard guard against two
+   * processes driving one instance is the .runner-pid liveness check, not this.
+   */
+  function resolveInstance(explicitId: string | null | undefined, sessionId: string | null): Resolution {
+    const instances = listInstances();
+
+    // 1. Explicit id (unique prefix allowed).
+    if (explicitId) {
+      const wanted = String(explicitId).trim();
+      const matches = instances.filter((i) => i.id === wanted);
+      const prefixMatches = matches.length > 0 ? matches : instances.filter((i) => i.id.startsWith(wanted));
+      if (prefixMatches.length === 1) {
+        const inst = prefixMatches[0];
+        return { ok: true, id: inst.id, attached: inst.owner !== sessionId };
+      }
+      if (prefixMatches.length === 0) {
+        return {
+          ok: false,
+          text: instances.length === 0
+            ? `没有找到实例 "${wanted}"。当前没有活跃的工作流实例。`
+            : `没有找到匹配 "${wanted}" 的实例。\n\n${formatInstanceList(instances)}`,
+        };
+      }
+      return { ok: false, text: `前缀 "${wanted}" 匹配到 ${prefixMatches.length} 个实例，请提供更长的前缀：\n\n${formatInstanceList(prefixMatches)}` };
+    }
+
+    // 2. An instance already owned by this session.
+    if (sessionId) {
+      const mine = instances.filter((i) => i.owner === sessionId);
+      if (mine.length >= 1) {
+        mine.sort((a, b) => (b.lastActivity?.getTime() || 0) - (a.lastActivity?.getTime() || 0));
+        return { ok: true, id: mine[0].id, attached: false };
+      }
+    }
+
+    // 3. No instance owned by this session.
+    if (instances.length === 0) {
+      return { ok: false, text: "没有活跃的工作流。使用 ralphflow_start 启动一个。" };
+    }
+    // Exactly one instance in the project → attach to it.
+    if (instances.length === 1) {
+      return { ok: true, id: instances[0].id, attached: instances[0].owner !== sessionId };
+    }
+    return { ok: false, text: formatInstanceList(instances, "存在多个实例，请显式指定要操作的实例：调用工具时传入 `instance: \"<实例ID>\"`（支持唯一前缀）。") };
+  }
+
+  /** Claim an instance for a session (writes session_id into its state). */
+  function bindInstance(instId: string, sessionId: string | null): void {
+    claimOwnership(instId, sessionId);
+  }
+
+  // ─── Instance destruction (complete / cancel) ───────────────────────────────
+
+  function archiveReport(instId: string, workflowName: string, status: string, records: StepExecutionRecord[]): string | null {
+    try {
+      const reportsDir = getReportsDir();
+      if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir, { recursive: true });
+      const reportPath = path.join(reportsDir, `${instId}-final-report.md`);
+      let artifactsNote = "";
+      try {
+        const artifactsDir = getArtifactsDir(instId);
+        if (fs.readdirSync(artifactsDir).length > 0) {
+          artifactsNote = `\n\n产出目录：\`${getArtifactsRelDir(instId)}/\`\n`;
+        }
+      } catch {}
+      atomicWriteText(reportPath, buildReportText(workflowName, status, records || []) + artifactsNote);
+      return reportPath;
+    } catch (e: any) {
+      diag("[ralph-flow] Report generation failed:", e.message);
+      return null;
+    }
+  }
+
+  /**
+   * Destroy an instance: abort any running session, archive the final report,
+   * remove the instance directory. Returns the archived report path.
+   */
+  function destroyInstance(instId: string, status: string): string | null {
+    let workflowName = instId;
+    const state = readState(instId);
+    if (state) workflowName = state.workflow_name;
+    const records = loadStepRecords(instId);
+    // Abort sessions running in THIS process. A runner in another process can't
+    // be reached here — it notices the instance is gone on its next state read,
+    // and its check verdict is discarded by the same staleness re-read.
+    try { platform.abortActiveCheck?.(instId); } catch {}
+    try { platform.abortActiveStep?.(instId); } catch {}
+    const reportPath = archiveReport(instId, workflowName, status, records);
+    // Resolve before the instance dir goes away — the artifacts-dir name file
+    // lives inside it.
+    const artifactsDir = getArtifactsDir(instId);
+    // Delete state.json first: even if the recursive removal partially fails
+    // (Windows EBUSY on files still held open), the instance is de-listed and
+    // can't act as a ghost.
+    try { fs.unlinkSync(getStateFile(instId)); } catch {}
+    try {
+      fs.rmSync(getInstanceDir(instId), { recursive: true, force: true });
+    } catch (e: any) {
+      diag("[ralph-flow] Error removing instance dir:", e.message);
+    }
+    // A workflow that produced nothing leaves no folder behind — rmdir refuses
+    // non-empty dirs, so real deliverables always outlive the instance.
+    try { fs.rmdirSync(artifactsDir); } catch {}
+    return reportPath;
+  }
+
+  // ─── Workflow Loader ────────────────────────────────────────────────────────
+
+  function getBuiltinWorkflowsDir(): string {
+    const __filename = fileURLToPath(import.meta.url);
+    // dist/engine/core.js → package root → workflows/
+    return path.join(path.dirname(__filename), "..", "..", "workflows");
+  }
+
+  function getProjectWorkflowsDir(): string {
+    return path.join(getRalphFlowDir(), "workflows");
+  }
+
+  // Global user workflows, available across ALL projects and surviving package
+  // updates (built-ins live inside the installed npm package, which is
+  // overwritten on update and not user-editable for a global install).
+  // Honors XDG_CONFIG_HOME.
+  function getGlobalConfigHome(): string | null {
+    const xdg = process.env.XDG_CONFIG_HOME;
+    if (xdg && path.isAbsolute(xdg)) return path.join(xdg, GLOBAL_CONFIG_DIRNAME);
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    if (!home) return null;
+    return path.join(home, ".config", GLOBAL_CONFIG_DIRNAME);
+  }
+
+  function getGlobalWorkflowsDir(): string | null {
+    const cfg = getGlobalConfigHome();
+    return cfg ? path.join(cfg, "workflows") : null;
+  }
+
+  function parseWorkflowFile(filePath: string, workflowName: string, problems?: string[]): WorkflowDef | null {
+    // Validation failures are collected into `problems` (when provided) so tool
+    // responses can tell the user WHY a workflow is unusable.
+    const problem = (msg: string) => { if (Array.isArray(problems)) problems.push(msg); };
+    const skipStep = (msg: string) => { diag(`[ralph-flow] ${msg}`); problem(msg); };
+    try {
+      const stats = fs.statSync(filePath);
+      if (stats.size > MAX_WORKFLOW_FILE_SIZE) {
+        diag(`[ralph-flow] Workflow file ${filePath} exceeds ${MAX_WORKFLOW_FILE_SIZE} bytes, skipped`);
+        problem(`工作流文件超过 ${MAX_WORKFLOW_FILE_SIZE} 字节上限`);
+        return null;
+      }
+      const content = stripBom(fs.readFileSync(filePath, "utf-8"));
+      const parsed: any = yaml.load(content);
+
+      if (!parsed || typeof parsed !== "object") { problem("YAML 内容不是对象"); return null; }
+      if (!Array.isArray(parsed.steps) || parsed.steps.length === 0) { problem("缺少非空的 steps 数组"); return null; }
+
+      const validSteps: StepDef[] = [];
+      for (let i = 0; i < parsed.steps.length; i++) {
+        const step = parsed.steps[i];
+        if (!step || typeof step !== "object") { skipStep(`Step ${i} in ${workflowName}: not an object, skipped`); continue; }
+        if (!step.id || typeof step.id !== "string") { skipStep(`Step ${i} in ${workflowName}: missing/invalid 'id', skipped`); continue; }
+        if (!step.desc || typeof step.desc !== "string") { skipStep(`Step "${step.id}" in ${workflowName}: missing/invalid 'desc', skipped`); continue; }
+        if (!step.on_pass || typeof step.on_pass !== "string") { skipStep(`Step "${step.id}" in ${workflowName}: missing/invalid 'on_pass', skipped`); continue; }
+        if (!step.on_fail || typeof step.on_fail !== "string") { skipStep(`Step "${step.id}" in ${workflowName}: missing/invalid 'on_fail', skipped`); continue; }
+        if (typeof step.max_fail_count !== "number" || step.max_fail_count < 1) { skipStep(`Step "${step.id}" in ${workflowName}: missing/invalid 'max_fail_count', skipped`); continue; }
+
+        // Validate input/output fields (they become the 输入说明/输出要求 sections of the DO/CHECK prompts)
+        if (!step.input || typeof step.input !== "string") {
+          skipStep(`Step "${step.id}" in ${workflowName}: missing/invalid 'input' field, skipped`);
+          continue;
+        }
+        if (!step.output || typeof step.output !== "string") {
+          skipStep(`Step "${step.id}" in ${workflowName}: missing/invalid 'output' field, skipped`);
+          continue;
+        }
+
+        if (step.workflow) {
+          if (typeof step.workflow !== "string") { skipStep(`Step "${step.id}" in ${workflowName}: invalid 'workflow', skipped`); continue; }
+          validSteps.push(step);
+          continue;
+        }
+
+        if (!step.do || typeof step.do !== "string") { skipStep(`Step "${step.id}" in ${workflowName}: missing/invalid 'do', skipped`); continue; }
+        if (!step.check || typeof step.check !== "string") { skipStep(`Step "${step.id}" in ${workflowName}: missing/invalid 'check', skipped`); continue; }
+        validSteps.push(step);
+      }
+
+      if (validSteps.length === 0) { problem("没有任何有效步骤"); return null; }
+
+      // Duplicate step ids make on_pass/on_fail ambiguous (getStep returns the
+      // first match, and the id Set silently collapses the rest) — a hard
+      // error, not a silent merge.
+      const dupIds = [...new Set(validSteps.map((s) => s.id).filter((id, i, arr) => arr.indexOf(id) !== i))];
+      if (dupIds.length > 0) {
+        problem(`步骤 id 重复：${dupIds.map((id) => `"${id}"`).join("、")}（每个步骤的 id 必须唯一）`);
+        return null;
+      }
+
+      // Validate on_pass/on_fail references
+      const stepIds = new Set(validSteps.map((s) => s.id));
+      for (const step of validSteps) {
+        if (step.on_pass !== "done" && !stepIds.has(step.on_pass)) {
+          diag(`[ralph-flow] Step "${step.id}" on_pass references unknown step "${step.on_pass}"`);
+          problem(`步骤 "${step.id}" 的 on_pass 引用了不存在的步骤 "${step.on_pass}"`);
+          return null;
+        }
+        if (!stepIds.has(step.on_fail)) {
+          diag(`[ralph-flow] Step "${step.id}" on_fail references unknown step "${step.on_fail}"`);
+          problem(`步骤 "${step.id}" 的 on_fail 引用了不存在的步骤 "${step.on_fail}"`);
+          return null;
+        }
+      }
+
+      const manual_step: string[] = Array.isArray(parsed.manual_step)
+        ? parsed.manual_step.filter((s: any) => typeof s === "string" && s.trim()).map((s: string) => s.trim())
+        : typeof parsed.manual_step === "string"
+          ? parsed.manual_step.split(",").map((s: string) => s.trim()).filter(Boolean)
+          : [];
+      // A typo'd manual_step entry would silently drop a human review gate the
+      // user is counting on — the workflow would run fully automated past the
+      // point that was supposed to stop for review. Hard error, not a warning.
+      const unknownManual = manual_step.filter((id) => !stepIds.has(id));
+      if (unknownManual.length > 0) {
+        diag(`[ralph-flow] manual_step in ${workflowName} references unknown step(s): ${unknownManual.join(", ")}`);
+        problem(`manual_step 引用了不存在的步骤：${unknownManual.map((s) => `"${s}"`).join("、")}`);
+        return null;
+      }
+
+      const adv = parsed.adversarial_check;
+      let adversarial_check: AdversarialCheckConfig | undefined = undefined;
+      if (adv && typeof adv === "object") {
+        // Both historical shapes are accepted. The object form ({providerID,
+        // modelID}) was the opencode SDK's own; pi-ai resolves strings, so it is
+        // normalized to "provider/model" here and everything downstream sees a
+        // string. A modelID without providerID is passed through bare and left
+        // for pi to resolve (doctor warns about it).
+        let model: string | undefined = undefined;
+        if (typeof adv.model === "string" && adv.model.trim()) {
+          model = adv.model.trim();
+        } else if (adv.model && typeof adv.model === "object") {
+          if (adv.model.modelID && typeof adv.model.modelID === "string") {
+            const modelID = adv.model.modelID.trim();
+            const providerID = typeof adv.model.providerID === "string" ? adv.model.providerID.trim() : "";
+            model = providerID ? `${providerID}/${modelID}` : modelID;
+          }
+        }
+
+        const system_prompt = typeof adv.system_prompt === "string" && adv.system_prompt.trim() ? adv.system_prompt.trim() : undefined;
+        const agent = typeof adv.agent === "string" && adv.agent.trim() ? adv.agent.trim() : undefined;
+
+        let timeout_ms: number | undefined = undefined;
+        if (typeof adv.timeout_ms === "number" && adv.timeout_ms > 0) {
+          timeout_ms = Math.min(adv.timeout_ms, MAX_ADVERSARIAL_TIMEOUT_MS); // Cap at 1 hour
+        }
+        const extra_allowed_bash: string[] | undefined = Array.isArray(adv.extra_allowed_bash)
+          ? [...new Set<string>(adv.extra_allowed_bash.filter((p: any) => typeof p === "string" && p.trim()).map((p: string) => p.trim()))]
+          : undefined;
+        adversarial_check = { model, agent, system_prompt, timeout_ms, extra_allowed_bash };
+      }
+
+      return {
+        name: workflowName,
+        description: parsed.description || validSteps[0].desc || workflowName,
+        manual_step,
+        steps: validSteps,
+        adversarial_check,
+      };
+    } catch (e: any) {
+      diag(`[ralph-flow] Error parsing workflow ${filePath}:`, e.message);
+      problem(`解析失败：${e.message}`);
+      return null;
+    }
+  }
+
+  function isValidWorkflowName(name: unknown): name is string {
+    // Reject names with path separators, traversal sequences, or special chars
+    return typeof name === "string" && name.length > 0 && name.length < 100
+      && !/[\/\\]/.test(name) && !name.includes("..") && !name.startsWith(".");
+  }
+
+  function loadWorkflow(workflowName: string, problems?: string[]): WorkflowDef | null {
+    if (!isValidWorkflowName(workflowName)) return null;
+    const globalDir = getGlobalWorkflowsDir();
+    // Resolution order: project > global user > built-in. A same-named
+    // workflow at an earlier tier shadows the later ones.
+    const searchPaths = [
+      path.join(getProjectWorkflowsDir(), `${workflowName}.yaml`),
+      path.join(getProjectWorkflowsDir(), `${workflowName}.yml`),
+      ...(globalDir ? [
+        path.join(globalDir, `${workflowName}.yaml`),
+        path.join(globalDir, `${workflowName}.yml`),
+      ] : []),
+      path.join(getBuiltinWorkflowsDir(), `${workflowName}.yaml`),
+      path.join(getBuiltinWorkflowsDir(), `${workflowName}.yml`),
+    ];
+    for (const p of searchPaths) {
+      if (fs.existsSync(p)) {
+        const result = parseWorkflowFile(p, workflowName, problems);
+        if (result) return result;
+      }
+    }
+    return null;
+  }
+
+  function listWorkflows(): Array<{ name: string; desc: string; invalid?: boolean }> {
+    const workflows = new Map<string, { name: string; desc: string; invalid?: boolean }>();
+    const scanDir = (dir: string) => {
+      if (!fs.existsSync(dir)) return;
+      try {
+        for (const file of fs.readdirSync(dir)) {
+          if (file.endsWith(".yaml") || file.endsWith(".yml")) {
+            try {
+              const filePath = path.join(dir, file);
+              const stats = fs.statSync(filePath);
+              if (stats.size > MAX_WORKFLOW_FILE_SIZE) {
+                diag(`[ralph-flow] Workflow file ${filePath} exceeds ${MAX_WORKFLOW_FILE_SIZE} bytes, skipped`);
+                continue;
+              }
+              const content = stripBom(fs.readFileSync(filePath, "utf-8"));
+              const parsed: any = yaml.load(content);
+              // Not workflow-shaped at all (stray yaml) — skip silently, as before.
+              if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.steps) || parsed.steps.length === 0) continue;
+              const name = file.replace(/\.(yaml|yml)$/, "");
+              // Run the FULL validation so the list agrees with what
+              // ralphflow_start will accept — a file that fails loadWorkflow must
+              // not be listed as launchable, it gets flagged instead.
+              const problems: string[] = [];
+              const wf = parseWorkflowFile(filePath, name, problems);
+              const existing = workflows.get(name);
+              if (wf) {
+                // First valid candidate in resolution order wins; a valid later
+                // candidate replaces an invalid earlier one — loadWorkflow falls
+                // through invalid files the same way.
+                if (!existing || existing.invalid) {
+                  workflows.set(name, { name, desc: wf.description });
+                }
+              } else if (!existing) {
+                workflows.set(name, {
+                  name,
+                  desc: `⚠️ 定义无效，无法启动：${problems[0] || "解析失败"}`,
+                  invalid: true,
+                });
+              }
+            } catch (e: any) {
+              diag(`[ralph-flow] Error reading workflow ${file}:`, e.message);
+            }
+          }
+        }
+      } catch (e: any) {
+        diag(`[ralph-flow] Error scanning dir ${dir}:`, e.message);
+      }
+    };
+    // Scan project → global → built-in — the first VALID writer wins, so a valid
+    // project workflow shadows a same-named global one which shadows a built-in,
+    // while an invalid one falls through. Matches loadWorkflow's resolution
+    // order exactly, so list and execution agree.
+    scanDir(getProjectWorkflowsDir());
+    const globalDir = getGlobalWorkflowsDir();
+    if (globalDir) scanDir(globalDir);
+    scanDir(getBuiltinWorkflowsDir());
+    return Array.from(workflows.values());
+  }
+
+  // ─── Workflow Doctor ────────────────────────────────────────────────────────
+  //
+  // Deep diagnosis behind the ralphflow_doctor tool. Reuses parseWorkflowFile so
+  // its verdicts always agree with what ralphflow_start actually accepts, then
+  // layers lints for problems the engine only surfaces at runtime (or never).
+
+  /**
+   * Lint a workflow that already passed full validation. Returns human-readable
+   * warning strings — things that won't stop ralphflow_start but will bite later.
+   * `rawParsed` is the untouched yaml.load result (parseWorkflowFile drops fields
+   * the lints need to see).
+   */
+  function lintWorkflow(wf: WorkflowDef, rawParsed: any): string[] {
+    const warnings: string[] = [];
+
+    // Unreachable steps: execution enters at steps[0] and only moves along
+    // on_pass/on_fail edges, so anything outside that closure never runs.
+    const byId = new Map(wf.steps.map((s) => [s.id, s]));
+    const reachable = new Set<string>();
+    const queue = [wf.steps[0].id];
+    while (queue.length > 0) {
+      const id = queue.pop()!;
+      if (reachable.has(id)) continue;
+      reachable.add(id);
+      const s = byId.get(id);
+      if (!s) continue;
+      if (s.on_pass !== "done") queue.push(s.on_pass);
+      queue.push(s.on_fail);
+    }
+    const unreachable = wf.steps.filter((s) => !reachable.has(s.id)).map((s) => s.id);
+    if (unreachable.length > 0) {
+      warnings.push(`步骤 ${unreachable.map((s) => `"${s}"`).join("、")} 从入口（steps 的第一项）沿 on_pass/on_fail 不可达，永远不会执行`);
+    }
+
+    // A workflow none of whose reachable steps can reach "done" never finishes.
+    if (!wf.steps.some((s) => reachable.has(s.id) && s.on_pass === "done")) {
+      warnings.push(`没有任何可达步骤的 on_pass 为 "done"，工作流永远无法正常完成`);
+    }
+
+    // Template tokens: the engine resolves exactly one token, {{artifacts_dir}}
+    // (byte-exact — even extra spaces inside the braces break it). Anything else
+    // reaches the DO/CHECK prompt unresolved.
+    for (const s of wf.steps) {
+      for (const field of ["desc", "do", "check", "input", "output"] as const) {
+        const text = (s as any)[field];
+        if (typeof text !== "string") continue;
+        for (const m of text.matchAll(/\{\{[^{}]*\}\}/g)) {
+          if (m[0] !== ARTIFACTS_TOKEN) {
+            warnings.push(`步骤 "${s.id}" 的 ${field} 含模板变量 ${m[0]}，引擎不会解析（唯一支持的记号是 ${ARTIFACTS_TOKEN}，花括号内不能有空格；产出目录本就会自动注入到提示词，通常不需要任何记号）`);
+          }
+        }
+      }
+    }
+
+    // Sub-workflow references resolve lazily at runtime — a broken one passes
+    // validation and then fails the workflow mid-run.
+    for (const s of wf.steps) {
+      if (!isSubWorkflowStep(s)) continue;
+      const subProblems: string[] = [];
+      if (!loadWorkflow(s.workflow, subProblems)) {
+        warnings.push(`步骤 "${s.id}" 引用的子工作流 "${s.workflow}" 无法加载（${subProblems[0] || "未找到定义文件"}）— 校验能通过，但运行到该步时工作流会失败`);
+      }
+    }
+    const cycle = findSubWorkflowCycle(wf.name);
+    if (cycle) {
+      warnings.push(`子工作流引用成环：${cycle.join(" → ")}。运行时会在嵌套深度 ${MAX_NESTING_DEPTH} 处报错暂停`);
+    }
+
+    // adversarial_check fields the engine clamps or reinterprets.
+    const adv = rawParsed && typeof rawParsed === "object" ? rawParsed.adversarial_check : undefined;
+    if (adv && typeof adv === "object") {
+      if (typeof adv.timeout_ms === "number" && adv.timeout_ms > MAX_ADVERSARIAL_TIMEOUT_MS) {
+        warnings.push(`adversarial_check.timeout_ms（${adv.timeout_ms}）超过 1 小时上限，会被截断为 ${MAX_ADVERSARIAL_TIMEOUT_MS}`);
+      }
+      if (typeof adv.model === "string" && adv.model.includes("/") === false && adv.model.trim()) {
+        warnings.push(`adversarial_check.model 是裸模型名（"${adv.model}"）——需要 "provider/model" 形式（如 "anthropic/claude-sonnet-4-5"，可加 ":high" 指定思考档位），无法解析时将回退到主会话当前模型`);
+      }
+      if (typeof adv.agent === "string" && adv.agent.trim()) {
+        warnings.push(`adversarial_check.agent（"${adv.agent}"）会被忽略：ralph-flow-pi 没有 agent 概念，验证者的只读沙箱由内置工具集预设保证（只读工具 + bash 白名单），比 agent 权限更严格`);
+      }
+      if (Array.isArray(adv.extra_allowed_bash)) {
+        const { rejected } = validateExtraAllowedBash(adv.extra_allowed_bash);
+        for (const r of rejected) {
+          warnings.push(`adversarial_check.extra_allowed_bash 中的 "${r.pattern}" 被拒绝：${r.reason}`);
+        }
+      }
+    }
+
+    return warnings;
+  }
+
+  /**
+   * DFS through sub-workflow references looking for a cycle starting at `name`.
+   * Returns the cycle path (["a", "b", "a"]) or null. `clean` memoizes names
+   * proven cycle-free so shared sub-workflows aren't re-walked.
+   */
+  function findSubWorkflowCycle(name: string, stack: string[] = [], clean = new Set<string>()): string[] | null {
+    if (clean.has(name)) return null;
+    const idx = stack.indexOf(name);
+    if (idx >= 0) return [...stack.slice(idx), name];
+    const wf = loadWorkflow(name);
+    if (wf) {
+      for (const s of wf.steps) {
+        if (!isSubWorkflowStep(s)) continue;
+        const cycle = findSubWorkflowCycle(s.workflow, [...stack, name], clean);
+        if (cycle) return cycle;
+      }
+    }
+    clean.add(name);
+    return null;
+  }
+
+  interface WorkflowCandidate {
+    source: "project" | "global" | "builtin";
+    sourceLabel: string;
+    file: string;
+    filePath: string;
+    relPath: string;
+    name: string;
+    verdict?: "valid" | "invalid" | "stray";
+    desc?: string;
+    warnings?: string[];
+    problems?: string[];
+  }
+
+  /**
+   * Diagnose every workflow file in all search dirs. Returns per-name entries
+   * in loadWorkflow's exact resolution order (project, global user, built-in)
+   * so "which file actually runs" is derivable, plus yaml files that aren't
+   * workflow-shaped at all.
+   */
+  function diagnoseWorkflowFiles(): { byName: Map<string, WorkflowCandidate[]>; strays: WorkflowCandidate[] } {
+    const globalDir = getGlobalWorkflowsDir();
+    const sources = [
+      { source: "project" as const, label: "项目自定义", dir: getProjectWorkflowsDir() },
+      ...(globalDir ? [{ source: "global" as const, label: "全局用户", dir: globalDir }] : []),
+      { source: "builtin" as const, label: "内置", dir: getBuiltinWorkflowsDir() },
+    ];
+    const byName = new Map<string, WorkflowCandidate[]>(); // name -> candidate[] in resolution order
+    const strays: WorkflowCandidate[] = [];                // yaml files that aren't workflow definitions
+
+    for (const { source, label, dir } of sources) {
+      if (!fs.existsSync(dir)) continue;
+      let files: string[];
+      try { files = fs.readdirSync(dir); } catch { continue; }
+      // .yaml before .yml within a dir, matching loadWorkflow's searchPaths.
+      files = files.filter((f) => f.endsWith(".yaml") || f.endsWith(".yml"))
+        .sort((a, b) => (a.endsWith(".yaml") ? 0 : 1) - (b.endsWith(".yaml") ? 0 : 1) || a.localeCompare(b));
+      for (const file of files) {
+        const filePath = path.join(dir, file);
+        const name = file.replace(/\.(yaml|yml)$/, "");
+        const relPath = source === "project"
+          ? `${RALPH_FLOW_DIRNAME}/workflows/${file}`
+          : source === "global"
+            ? `~/.config/${GLOBAL_CONFIG_DIRNAME}/workflows/${file}`
+            : `<内置>/workflows/${file}`;
+        const candidate: WorkflowCandidate = { source, sourceLabel: label, file, filePath, relPath, name };
+
+        try {
+          if (fs.statSync(filePath).size > MAX_WORKFLOW_FILE_SIZE) {
+            candidate.verdict = "invalid";
+            candidate.problems = [`工作流文件超过 ${MAX_WORKFLOW_FILE_SIZE} 字节上限`];
+            pushCandidate(byName, candidate);
+            continue;
+          }
+          let rawParsed: any;
+          try {
+            rawParsed = yaml.load(stripBom(fs.readFileSync(filePath, "utf-8")));
+          } catch (e: any) {
+            candidate.verdict = "invalid";
+            candidate.problems = [`YAML 解析失败：${e.message.split("\n")[0]}`];
+            pushCandidate(byName, candidate);
+            continue;
+          }
+          if (!rawParsed || typeof rawParsed !== "object" || !("steps" in rawParsed)) {
+            // Not workflow-shaped: probably a stray yaml, but the user may have
+            // MEANT it as a workflow — surface it instead of skipping silently.
+            candidate.verdict = "stray";
+            strays.push(candidate);
+            continue;
+          }
+          const problems: string[] = [];
+          const wf = parseWorkflowFile(filePath, name, problems);
+          if (wf) {
+            candidate.verdict = "valid";
+            candidate.desc = wf.description;
+            // Soft problems (skipped steps) that didn't invalidate the file are
+            // exactly the silent-drop trap — merge them with the lints.
+            candidate.warnings = [
+              ...problems.map((p) => `${p}（该步骤已被静默丢弃，工作流其余部分照常运行）`),
+              ...lintWorkflow(wf, rawParsed),
+            ];
+          } else {
+            candidate.verdict = "invalid";
+            candidate.problems = problems.length > 0 ? problems : ["解析失败"];
+          }
+          pushCandidate(byName, candidate);
+        } catch (e: any) {
+          candidate.verdict = "invalid";
+          candidate.problems = [`读取失败：${e.message}`];
+          pushCandidate(byName, candidate);
+        }
+      }
+    }
+    return { byName, strays };
+  }
+
+  function pushCandidate(byName: Map<string, WorkflowCandidate[]>, candidate: WorkflowCandidate): void {
+    if (!byName.has(candidate.name)) byName.set(candidate.name, []);
+    byName.get(candidate.name)!.push(candidate);
+  }
+
+  /** Instance-dir health: state.json missing or corrupt makes an instance invisible to every tool. */
+  function diagnoseInstances(): string[] {
+    const issues: string[] = [];
+    const root = getInstancesRoot();
+    if (!fs.existsSync(root)) return issues;
+    let entries;
+    try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return issues; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const stateFile = path.join(root, entry.name, "state.json");
+      if (!fs.existsSync(stateFile)) {
+        issues.push(`实例目录 \`instances/${entry.name}/\` 缺少 state.json — 所有工具都看不到它。若是残留目录可直接删除`);
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(stripBom(fs.readFileSync(stateFile, "utf-8")));
+        if (!parsed || typeof parsed !== "object") throw new Error("not an object");
+      } catch (e: any) {
+        issues.push(`实例 \`${entry.name}\` 的 state.json 损坏（${e.message.split("\n")[0]}）— 该实例无法恢复，确认无需保留后可删除整个目录`);
+      }
+    }
+    return issues;
+  }
+
+  function buildDoctorReport(): string {
+    const { byName, strays } = diagnoseWorkflowFiles();
+    const instanceIssues = diagnoseInstances();
+
+    const sections: string[] = [];
+    let launchable = 0, withWarnings = 0, broken = 0;
+    const detailLines: string[] = [];
+
+    const names = Array.from(byName.keys()).sort((a, b) => a.localeCompare(b));
+    for (const name of names) {
+      const candidates = byName.get(name)!;
+      const effective = candidates.find((c) => c.verdict === "valid") || null;
+      const lines = [`### ${name}`];
+
+      if (effective) {
+        launchable++;
+        const shadowed = candidates.filter((c) => c !== effective);
+        let sourceNote = `${effective.relPath}（${effective.sourceLabel}`;
+        // A valid candidate LATER in resolution order is shadowed by this one.
+        const shadowedValid = shadowed.find((c) => c.verdict === "valid" && candidates.indexOf(c) > candidates.indexOf(effective));
+        if (shadowedValid) {
+          sourceNote += `，遮蔽了同名${shadowedValid.sourceLabel} ${shadowedValid.relPath}`;
+        }
+        sourceNote += "）";
+        lines.push(`- 生效文件：${sourceNote}`);
+        // An invalid candidate EARLIER in resolution order means the user's file
+        // is being silently skipped in favor of this one — worth shouting about.
+        const brokenBefore = candidates.slice(0, candidates.indexOf(effective)).filter((c) => c.verdict === "invalid");
+        for (const b of brokenBefore) {
+          broken++;
+          lines.push(`- ❌ ${b.relPath} 定义无效，已回退到上面的生效文件（启动的不是你这份！）`);
+          for (const p of b.problems || []) lines.push(`  - ${p}`);
+        }
+        if ((effective.warnings || []).length > 0) {
+          withWarnings++;
+          lines.push(`- ✅ 可启动，但有 ${effective.warnings!.length} 条警告：`);
+          for (const w of effective.warnings!) lines.push(`  - ⚠️ ${w}`);
+        } else {
+          lines.push(`- ✅ 可启动，无警告`);
+        }
+        // Invalid candidates AFTER the effective one are harmless (never reached)
+        // — mention them only so the user knows the file exists and is dead.
+        const deadAfter = candidates.slice(candidates.indexOf(effective) + 1).filter((c) => c.verdict === "invalid");
+        for (const d of deadAfter) {
+          lines.push(`- ℹ️ ${d.relPath} 定义无效，但已被上面的生效文件遮蔽，不影响使用（问题：${(d.problems || [])[0]}）`);
+        }
+      } else {
+        broken += candidates.length;
+        lines.push(`- ❌ 无法启动（没有任何有效定义）`);
+        for (const c of candidates) {
+          lines.push(`- 文件 ${c.relPath}：`);
+          for (const p of c.problems || []) lines.push(`  - ${p}`);
+        }
+      }
+      detailLines.push(lines.join("\n"));
+    }
+
+    sections.push(`# Ralph Flow 工作流诊断\n\n## 概览\n\n- 可启动工作流：**${launchable}** 个${withWarnings > 0 ? `（其中 ${withWarnings} 个有警告）` : ""}\n- 有问题的定义文件：**${broken}** 个\n- 非工作流 YAML：**${strays.length}** 个\n- 实例目录异常：**${instanceIssues.length}** 个`);
+
+    if (detailLines.length > 0) {
+      sections.push(`## 工作流详情\n\n${detailLines.join("\n\n")}`);
+    } else {
+      sections.push(`## 工作流详情\n\n三个目录（项目 ${RALPH_FLOW_DIRNAME}/workflows/、全局 ~/.config/${GLOBAL_CONFIG_DIRNAME}/workflows/、内置 workflows/）里都没有找到工作流定义文件。可以用 /ralphflow-create 交互式创建一个。`);
+    }
+
+    if (strays.length > 0) {
+      sections.push(`## 被忽略的 YAML 文件\n\n以下文件不是工作流定义（缺少 steps 数组），list/start 都会忽略它们。若本意是工作流，需要补上 steps：\n\n${strays.map((s) => `- ${s.relPath}`).join("\n")}`);
+    }
+
+    if (instanceIssues.length > 0) {
+      sections.push(`## 实例目录异常\n\n${instanceIssues.map((i) => `- ⚠️ ${i}`).join("\n")}`);
+    }
+
+    const projectDirExists = fs.existsSync(getProjectWorkflowsDir());
+    const hasProjectWorkflow = names.some((n) => byName.get(n)!.some((c) => c.source === "project"));
+    const hasGlobalWorkflow = names.some((n) => byName.get(n)!.some((c) => c.source === "global"));
+    if (!hasProjectWorkflow && !hasGlobalWorkflow) {
+      sections.push(`## 提示\n\n还没有自定义工作流${projectDirExists ? "" : `（${RALPH_FLOW_DIRNAME}/workflows/ 目录尚未创建）`}。内置工作流开箱即用；要定制自己的流程，可以运行 /ralphflow-create 交互式创建。放在 \`${RALPH_FLOW_DIRNAME}/workflows/\` 只对本项目生效；放在全局 \`~/.config/${GLOBAL_CONFIG_DIRNAME}/workflows/\` 则所有项目可用（且版本更新不会覆盖）。`);
+    }
+
+    return sections.join("\n\n");
+  }
+
+  // ─── Step Helpers ───────────────────────────────────────────────────────────
+
+  function getStep(workflow: WorkflowDef, stepId: string): StepDef | null {
+    return workflow.steps.find((s) => s.id === stepId) || null;
+  }
+
+  function buildDoPrompt(instId: string, step: NormalStepDef, userTask?: string, retryContext?: string, retryCount?: number): string {
+    const sections: string[] = [];
+    const isRetry = retryContext || (retryCount && retryCount > 0);
+
+    if (userTask) sections.push(`## 用户需求\n\n${userTask}`);
+    if (retryContext) sections.push(`## 上次失败原因\n\n${retryContext}`);
+    if (retryCount && retryCount > 0) {
+      sections.push(`## 重试信息\n\n这是第 **${retryCount}** 次重试，最大重试次数为 **${step.max_fail_count}** 次。`);
+    }
+    if (sections.length > 0) sections.push("---");
+
+    try { fs.mkdirSync(getArtifactsDir(instId), { recursive: true }); } catch {}
+
+    sections.push(`## 当前任务
+
+**步骤**：${step.id}
+**描述**：${step.desc}
+
+**任务**：${renderStepText(instId, step.do)}
+
+**输入说明**：${renderStepText(instId, step.input)}
+
+**输出要求**：${renderStepText(instId, step.output)}
+
+**产出目录**：\`${getArtifactsRelDir(instId)}/\` — 本工作流的文档产出（清单、方案、报告等）统一放在此目录。步骤中提到的文档文件名（如 checkpoints.md）若未写路径，即指此目录下的文件；明确写了其他路径的除外。`);
+
+    // The completion instruction is the one part that is NOT a mirror of the
+    // plugin versions: they asked for a `<promise>done</promise>` tag on the
+    // last line and parsed it back out. A tool call cannot be faked by prose,
+    // can't land inside a code fence, and can't be truncated.
+    if (isRetry) {
+      sections.push(`---
+
+## 执行指令
+
+上次执行未通过，原因见上方。请执行以下操作：
+
+1. **针对上述失败原因进行修复**，不要重复之前未通过的做法
+2. 完成实际工作（修改代码、创建文件、执行命令等）
+3. 所有任务要求和输出要求都满足后，调用 \`report_done\` 工具 — 这是结束本步骤的唯一方式
+
+不要只描述你打算怎么做，直接去做。工作未完成时不要调用 report_done。`);
+    } else {
+      sections.push(`---
+
+## 执行指令
+
+请执行上述任务。完成实际工作（修改代码、创建文件、执行命令等），不要只做分析或规划。
+
+所有任务要求和输出要求都满足后，调用 \`report_done\` 工具 — 这是结束本步骤的唯一方式。
+
+如果遇到无法解决的问题，说明具体问题，不要调用 report_done。`);
+    }
+    const prompt = sections.join("\n\n");
+    // Cache the do prompt: the runner re-injects it after a context compaction,
+    // and ralphflow_start/continue echo it into the transcript.
+    writeDoPromptCache(prompt, instId);
+    return prompt;
+  }
+
+  function buildCheckPrompt(instId: string, step: NormalStepDef, userTask?: string): string {
+    const sections: string[] = [];
+    if (userTask) sections.push(`## 用户需求\n\n${userTask}`);
+    sections.push(`## Do 阶段任务
+
+**步骤**：${step.id}
+**任务描述**：${renderStepText(instId, step.do)}
+**输入**：${renderStepText(instId, step.input)}
+**预期输出**：${renderStepText(instId, step.output)}
+**产出目录**：\`${getArtifactsRelDir(instId)}/\` — 检查依据中未写路径的文档文件名即指此目录下的文件`);
+    if (sections.length > 0) sections.push("---");
+    sections.push(`## 检查依据
+
+${renderStepText(instId, step.check)}
+
+---
+
+请基于上述信息，自主探索项目验证任务完成情况。基于你自己的探索结果判断，不要依赖任何外部提供的"实现总结"。
+
+检查完成后**必须调用 \`verdict\` 工具**提交结论：
+- 通过：\`verdict(pass=true, reason="<通过的具体原因>")\`
+- 不通过：\`verdict(pass=false, reason="<失败的具体原因>")\`
+
+只输出文字不调用 verdict 工具，等同于没有给出结论。`);
+    return sections.join("\n\n");
+  }
+
+  function buildSubWorkflowUserTask(instId: string, step: SubWorkflowStepDef, parentUserTask: string): string {
+    const parts: string[] = [];
+    if (step.inputs && typeof step.inputs === "object" && !Array.isArray(step.inputs)) {
+      for (const [key, value] of Object.entries(step.inputs)) {
+        parts.push(`${key}: ${renderStepText(instId, String(value))}`);
+      }
+    }
+    if (parentUserTask) {
+      if (parts.length > 0) parts.push("");
+      parts.push(`原始需求：${parentUserTask}`);
+    }
+    return parts.join("\n");
+  }
+
+  /**
+   * Recursively resolve a sub-workflow entry point.
+   * If the sub-workflow's first step is itself a sub-workflow, push intermediate states and recurse.
+   * Returns { text, error? } where text is the do prompt for the deepest normal step.
+   */
+  function resolveSubWorkflowEntry(instId: string, subWorkflowName: string, parentUserTask: string, parentStep: SubWorkflowStepDef, maxDepth?: number, retryContext?: string, retryCount?: number): { text: string; error?: boolean } {
+    const depth = getStackDepth(instId);
+    if (depth >= (maxDepth || MAX_NESTING_DEPTH)) {
+      return { text: `嵌套深度超过限制（${depth}/${maxDepth || MAX_NESTING_DEPTH}）。可能存在循环引用。`, error: true };
+    }
+
+    const subProblems: string[] = [];
+    const subWorkflow = loadWorkflow(subWorkflowName, subProblems);
+    if (!subWorkflow) {
+      return {
+        text: subProblems.length > 0
+          ? `子工作流 "${subWorkflowName}" 定义无效：\n${subProblems.map((p) => `- ${p}`).join("\n")}`
+          : `子工作流 "${subWorkflowName}" 未找到。`,
+        error: true,
+      };
+    }
+
+    const firstStep = subWorkflow.steps[0];
+    if (!firstStep) {
+      return { text: `子工作流 "${subWorkflowName}" 没有步骤。`, error: true };
+    }
+
+    const subUserTask = buildSubWorkflowUserTask(instId, parentStep, parentUserTask);
+
+    if (isSubWorkflowStep(firstStep)) {
+      // Push intermediate state and recurse
+      const intermediateState: RalphFlowState = {
+        active: true, workflow_name: subWorkflowName, current_step: firstStep.id,
+        current_phase: "do", fail_count: 0, user_task: subUserTask, paused: false,
+      };
+      pushState(intermediateState, instId);
+      const result = resolveSubWorkflowEntry(instId, firstStep.workflow, subUserTask, firstStep, maxDepth, retryContext, retryCount);
+      if (result.error) {
+        popState(instId); // undo the push on error
+      }
+      return result;
+    }
+
+    // Normal first step — write state and return do prompt
+    writeState({
+      active: true, workflow_name: subWorkflowName, current_step: firstStep.id,
+      current_phase: "do", fail_count: 0, user_task: subUserTask, paused: false,
+    }, instId);
+    // If the sub-workflow's first step is manual, arm the marker for the runner
+    if (subWorkflow.manual_step && subWorkflow.manual_step.includes(firstStep.id)) {
+      writeManualStepMarker(instId);
+    } else {
+      clearManualStepMarker(instId);
+    }
+    recordStepStart(instId, firstStep.id, "do");
+    logEvent(instId, "info", "step_start", { step: firstStep.id, phase: "do" });
+    return { text: buildDoPrompt(instId, firstStep, subUserTask, retryContext, retryCount) };
+  }
+
+  // ─── State Stack (for sub-workflows, per instance) ──────────────────────────
+
+  function getStackFile(instId: string): string {
+    return instPath(STACK_FILENAME, instId);
+  }
+
+  function pushState(state: RalphFlowState, instId: string): void {
+    try {
+      const stackFile = getStackFile(instId);
+      let stack: RalphFlowState[] = [];
+      if (fs.existsSync(stackFile)) {
+        try {
+          const parsed = JSON.parse(stripBom(fs.readFileSync(stackFile, "utf-8")));
+          if (Array.isArray(parsed)) stack = parsed;
+          else diag("[ralph-flow] Stack file is not an array, starting fresh");
+        } catch (parseErr: any) {
+          diag("[ralph-flow] Stack file corrupted, backing up and starting fresh:", parseErr.message);
+          try { fs.renameSync(stackFile, stackFile + ".corrupted." + Date.now()); } catch {}
+        }
+      }
+      stack.push(state);
+      atomicWriteJson(stackFile, stack);
+    } catch (e: any) {
+      diag("[ralph-flow] Error pushing state:", e.message);
+    }
+  }
+
+  function popState(instId: string): RalphFlowState | null {
+    try {
+      const stackFile = getStackFile(instId);
+      if (!fs.existsSync(stackFile)) return null;
+      let stack: RalphFlowState[];
+      try {
+        stack = JSON.parse(stripBom(fs.readFileSync(stackFile, "utf-8")));
+      } catch (parseErr: any) {
+        diag("[ralph-flow] Stack file corrupted, backing up and clearing:", parseErr.message);
+        try { fs.renameSync(stackFile, stackFile + ".corrupted." + Date.now()); } catch {}
+        return null;
+      }
+      if (!Array.isArray(stack) || stack.length === 0) return null;
+      const parentState = stack.pop()!;
+      atomicWriteJson(stackFile, stack);
+      return parentState;
+    } catch (e: any) {
+      diag("[ralph-flow] Error popping state:", e.message);
+      return null;
+    }
+  }
+
+  function getStackDepth(instId: string): number {
+    try {
+      const stackFile = getStackFile(instId);
+      if (!fs.existsSync(stackFile)) return 0;
+      const stack = JSON.parse(stripBom(fs.readFileSync(stackFile, "utf-8")));
+      return Array.isArray(stack) ? stack.length : 0;
+    } catch { return 0; }
+  }
+
+  // ─── Log Helpers ────────────────────────────────────────────────────────────
+
+  function getLogDir(instId: string): string {
+    // Fall back to the global logs dir after the instance dir was destroyed
+    // (e.g. a cancel during a check) — never resurrect a deleted dir.
+    if (!instId || !fs.existsSync(getInstanceDir(instId))) return path.join(getRalphFlowDir(), "logs");
+    return path.join(getInstanceDir(instId), "logs");
+  }
+
+  function ensureLogDir(instId: string): void {
+    const logDir = getLogDir(instId);
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+  }
+
+  const MAX_LOG_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+  const MAX_LOG_ROTATIONS = 3;
+
+  function rotateLogIfNeeded(instId: string): void {
+    try {
+      const logFile = path.join(getLogDir(instId), "execution.log");
+      if (!fs.existsSync(logFile)) return;
+      const stats = fs.statSync(logFile);
+      if (stats.size < MAX_LOG_SIZE_BYTES) return;
+      // Rotate: .3 → delete, .2 → .3, .1 → .2, current → .1
+      for (let i = MAX_LOG_ROTATIONS; i >= 1; i--) {
+        const older = `${logFile}.${i}`;
+        if (i === MAX_LOG_ROTATIONS) { if (fs.existsSync(older)) fs.unlinkSync(older); }
+        else { if (fs.existsSync(older)) fs.renameSync(older, `${logFile}.${i + 1}`); }
+      }
+      fs.renameSync(logFile, `${logFile}.1`);
+    } catch (e: any) {
+      diag("[ralph-flow] Log rotation failed:", e.message);
+    }
+  }
+
+  function logEvent(instId: string, level: string, event: string, extra?: Record<string, unknown>): void {
+    try {
+      ensureLogDir(instId);
+      rotateLogIfNeeded(instId);
+      const entry = { ts: new Date().toISOString(), level, event, ...extra };
+      fs.appendFileSync(path.join(getLogDir(instId), "execution.log"), JSON.stringify(entry) + "\n");
+    } catch (e: any) {
+      diag(`[ralph-flow] Log failed (${event}):`, e.message);
+    }
+  }
+
+  // ─── Step Records Persistence (per instance) ────────────────────────────────
+
+  const STEP_RECORDS_FILENAME = "step-records.json";
+
+  function getStepRecordsFile(instId: string): string {
+    return path.join(getLogDir(instId), STEP_RECORDS_FILENAME);
+  }
+
+  function loadStepRecords(instId: string): StepExecutionRecord[] {
+    try {
+      const file = getStepRecordsFile(instId);
+      if (fs.existsSync(file)) {
+        try {
+          const parsed = JSON.parse(stripBom(fs.readFileSync(file, "utf-8")));
+          if (Array.isArray(parsed)) return parsed;
+          diag("[ralph-flow] Step records file is not an array, resetting");
+        } catch (parseErr: any) {
+          diag("[ralph-flow] Step records file corrupted, backing up:", parseErr.message);
+          try { fs.renameSync(file, file + ".corrupted." + Date.now()); } catch {}
+        }
+      }
+    } catch (e: any) {
+      diag("[ralph-flow] Error loading step records:", e.message);
+    }
+    return [];
+  }
+
+  function saveStepRecords(instId: string, records: StepExecutionRecord[]): void {
+    try {
+      ensureLogDir(instId);
+      atomicWriteJson(getStepRecordsFile(instId), records);
+    } catch (e: any) {
+      diag("[ralph-flow] Error saving step records:", e.message);
+    }
+  }
+
+  // ─── Report Generation ──────────────────────────────────────────────────────
+
+  function formatDuration(startTime: string, endTime: string): string {
+    const durationMs = Math.max(0, new Date(endTime).getTime() - new Date(startTime).getTime());
+    const minutes = Math.floor(durationMs / 60000);
+    const seconds = Math.floor((durationMs % 60000) / 1000);
+    return minutes > 0 ? `${minutes}m${seconds}s` : `${seconds}s`;
+  }
+
+  function buildReportText(workflowName: string, status: string, stepRecords: StepExecutionRecord[]): string {
+    const totalFailures = stepRecords.reduce((sum, s) => sum + (s.failCount || 0), 0);
+    const startTime = stepRecords.length > 0 ? stepRecords[0].startTime : new Date().toISOString();
+    const endTime = stepRecords.length > 0 ? stepRecords[stepRecords.length - 1].endTime || new Date().toISOString() : new Date().toISOString();
+
+    const statusCn: Record<string, string> = { completed: "已完成", cancelled: "已取消", paused: "已暂停" };
+
+    const lines = [
+      "# 工作流执行报告", "",
+      "## 执行摘要", "",
+      `- **工作流**: ${workflowName}`,
+      `- **状态**: ${statusCn[status] || status}`,
+      `- **总步骤数**: ${stepRecords.length}`,
+      `- **失败次数**: ${totalFailures}`,
+      `- **总耗时**: ${formatDuration(startTime, endTime)}`,
+      "", "## 步骤执行情况", "",
+    ];
+
+    for (let i = 0; i < stepRecords.length; i++) {
+      const step = stepRecords[i];
+      const icon = step.status === "passed" ? "✓" : "✗";
+      lines.push(`### ${i + 1}. ${step.stepId} (${step.phase}) ${icon}`);
+      lines.push(`- 状态：${step.status === "passed" ? "通过" : "失败"}`);
+      if (step.failCount > 0) lines.push(`- 失败次数：${step.failCount}`);
+      if (step.reason) lines.push(`- ${step.status === "passed" ? "通过原因" : "失败原因"}：${step.reason}`);
+      if (step.startTime && step.endTime) lines.push(`- 耗时：${formatDuration(step.startTime, step.endTime)}`);
+      lines.push("");
+    }
+
+    return lines.join("\n");
+  }
+
+  // ─── Workflow Advancement Logic (shared by the runner) ──────────────────────
+
+  function handleCheckPassed(instId: string, state: RalphFlowState, workflow: WorkflowDef, step: StepDef, checkResult: { reason?: string }): TransitionResult {
+    // Note: manual steps do not pause after the check — the manual review gate
+    // sits BEFORE the check (the runner stops when the DO phase of a manual step
+    // completes; the user's ralphflow_continue call is the approval that starts
+    // the check). Once the check passes, the workflow advances.
+
+    if (step.on_pass === "done") {
+      const parentState = popState(instId);
+      if (parentState) {
+        const parentWorkflow = loadWorkflow(parentState.workflow_name);
+        if (parentWorkflow) {
+          const parentStep = getStep(parentWorkflow, parentState.current_step);
+          if (parentStep) {
+            // Sub-workflow completed — advance to parent step's on_pass target
+            const grandparentResult = handleCheckPassed(instId,
+              { ...parentState, current_phase: "do", fail_count: 0, last_failure_reason: undefined, paused: false, pause_reason: undefined },
+              parentWorkflow, parentStep, { reason: `子工作流 "${state.workflow_name}" 已完成。` }
+            );
+            // Only record parent step's check as passed if transition succeeded and
+            // the instance still exists (a completed workflow already destroyed it)
+            if (!grandparentResult.paused && !grandparentResult.completed) {
+              addStepRecord(instId, parentState.current_step, "check", "passed", parentState.fail_count || 0, `子工作流 "${state.workflow_name}" 已完成。`);
+            }
+            logEvent(instId, "info", "sub_workflow_end", { workflow: state.workflow_name, parent_workflow: parentState.workflow_name, parent_step: parentState.current_step });
+            return {
+              text: `## 检查结果：通过 ✓\n\n${checkResult.reason || "检查通过。"}\n\n---\n\n## 子工作流 "${state.workflow_name}" 已完成！\n\n---\n\n${grandparentResult.text}`,
+              paused: grandparentResult.paused,
+              completed: grandparentResult.completed,
+            };
+          }
+        }
+        // Parent workflow not found — push parent state back and pause so user can fix and resume
+        pushState({ ...parentState, paused: true, pause_reason: "config_error", last_failure_reason: `父工作流 "${parentState.workflow_name}" 加载失败。` }, instId);
+        writeState({ ...parentState, paused: true, pause_reason: "config_error", last_failure_reason: `父工作流 "${parentState.workflow_name}" 加载失败。` }, instId);
+        logEvent(instId, "warn", "parent_workflow_not_found", { workflow: state.workflow_name, parent_workflow: parentState.workflow_name });
+        return {
+          text: `## 检查结果：通过 ✓\n\n${checkResult.reason || "检查通过。"}\n\n---\n\n子工作流 "${state.workflow_name}" 已完成，但父工作流 "${parentState.workflow_name}" 加载失败。工作流已暂停 — 请修复工作流 YAML 后调用 \`ralphflow_continue\` 恢复。`,
+          paused: true,
+        };
+      }
+      // No parent — this is the top-level workflow, complete it.
+      // Archive the report and destroy the instance directory.
+      const reportPath = destroyInstance(instId, "completed");
+      logEvent(instId, "info", "workflow_end", { workflow: state.workflow_name });
+      return {
+        text: `## 检查结果：通过 ✓\n\n${checkResult.reason || "检查通过。"}\n\n---\n\n## 工作流完成！\n\n所有步骤已验证通过。${reportPath ? `执行报告：${path.relative(projectDir, reportPath)}` : ""}`,
+        completed: true,
+      };
+    }
+
+    const nextStep = getStep(workflow, step.on_pass);
+    if (!nextStep) {
+      logEvent(instId, "error", "next_step_not_found", { step: state.current_step, on_pass: step.on_pass });
+      writeState({ ...state, paused: true, pause_reason: "config_error", last_failure_reason: `下一步 "${step.on_pass}" 在工作流定义中未找到。` }, instId);
+      return { text: `## 检查结果：通过 ✓\n\n下一步 "${step.on_pass}" 在工作流定义中未找到。\n\n## 工作流已暂停\n\n工作流配置错误。请修复工作流定义，然后调用 \`ralphflow_continue\` 恢复。`, paused: true };
+    }
+
+    if (isSubWorkflowStep(nextStep)) {
+      recordStepStart(instId, nextStep.id, "do");
+      logEvent(instId, "info", "step_start", { step: nextStep.id, phase: "do" });
+      // Write parent's next step state before entering sub-workflow.
+      // This ensures the state file reflects the correct parent step after sub-workflow completes
+      const nextState = { ...state, current_step: nextStep.id, current_phase: "do", fail_count: 0, last_failure_reason: undefined, paused: false, pause_reason: undefined };
+      writeState(nextState, instId);
+      pushState({ ...state, current_step: nextStep.id, current_phase: "do", fail_count: 0, paused: false, pause_reason: undefined }, instId);
+      const subResult = resolveSubWorkflowEntry(instId, nextStep.workflow, state.user_task, nextStep);
+      if (subResult.error) {
+        popState(instId);
+        writeState({ ...state, paused: true, pause_reason: "config_error", last_failure_reason: subResult.text }, instId);
+        return { text: subResult.text, paused: true };
+      }
+      return {
+        text: `## 检查结果：通过 ✓\n\n${checkResult.reason || "检查通过。"}\n\n---\n\n## 进入子工作流：${nextStep.id}\n\n---\n\n${subResult.text}`,
+      };
+    }
+
+    const nextState = { ...state, current_step: nextStep.id, current_phase: "do", fail_count: 0, last_failure_reason: undefined, paused: false, pause_reason: undefined };
+    writeState(nextState, instId);
+    recordStepStart(instId, nextStep.id, "do");
+    logEvent(instId, "info", "step_start", { step: nextStep.id, phase: "do" });
+    return {
+      text: `## 检查结果：通过 ✓\n\n${checkResult.reason || "检查通过。"}\n\n---\n\n下一步：**${nextStep.id}** - ${nextStep.desc}\n\n---\n\n${buildDoPrompt(instId, nextStep, state.user_task)}`,
+    };
+  }
+
+  function handleCheckFailed(instId: string, state: RalphFlowState, workflow: WorkflowDef, step: StepDef, checkResult: { reason?: string }): TransitionResult {
+    const newFailCount = state.fail_count + 1;
+    logEvent(instId, "warn", "fail_count_increment", { step: state.current_step, fail_count: newFailCount });
+
+    if (newFailCount >= step.max_fail_count) {
+      const parentState = popState(instId);
+      if (parentState) {
+        const parentFailCount = parentState.fail_count + 1;
+        // Check if parent step's max_fail_count is exceeded
+        const parentWorkflow = loadWorkflow(parentState.workflow_name);
+        const parentStep = parentWorkflow ? getStep(parentWorkflow, parentState.current_step) : null;
+        if (parentStep && parentFailCount >= parentStep.max_fail_count) {
+          // Parent step also exceeded max failures — pause parent workflow
+          // Push parent state back to stack so resume/cancel can restore nesting
+          pushState({ ...parentState, current_phase: "do", fail_count: parentFailCount, paused: true, pause_reason: "max_failures", last_failure_reason: checkResult.reason }, instId);
+          writeState({ ...parentState, current_phase: "do", fail_count: parentFailCount, paused: true, pause_reason: "max_failures", last_failure_reason: checkResult.reason }, instId);
+          logEvent(instId, "warn", "workflow_paused", { workflow: parentState.workflow_name, step: parentState.current_step, fail_count: parentFailCount });
+          return {
+            text: `## 检查结果：失败 ✗ (${newFailCount}/${step.max_fail_count})\n\n${checkResult.reason || "检查失败。"}\n\n---\n\n## 工作流已暂停\n\n子工作流失败且父步骤最大失败次数 (${parentFailCount}/${parentStep.max_fail_count}) 已达。请修复问题，然后调用 \`ralphflow_continue\` 恢复。`,
+            paused: true,
+          };
+        }
+        // Parent step not at max — follow parent's on_fail
+        if (!parentWorkflow || !parentStep) {
+          // Push parent state back so resume can restore the stack
+          pushState({ ...parentState, fail_count: parentFailCount, paused: true, pause_reason: "config_error", last_failure_reason: `父工作流 "${parentState.workflow_name}" 或步骤 "${parentState.current_step}" 未找到。` }, instId);
+          writeState({ ...parentState, fail_count: parentFailCount, paused: true, pause_reason: "config_error", last_failure_reason: `父工作流 "${parentState.workflow_name}" 或步骤 "${parentState.current_step}" 未找到。` }, instId);
+          logEvent(instId, "error", "parent_workflow_or_step_not_found", { workflow: parentState.workflow_name, step: parentState.current_step });
+          return {
+            text: `## 检查结果：失败 ✗ (${newFailCount}/${step.max_fail_count})\n\n${checkResult.reason || "检查失败。"}\n\n---\n\n父工作流或步骤未找到。工作流已暂停。`,
+            paused: true,
+          };
+        }
+        const failStep = getStep(parentWorkflow, parentStep.on_fail);
+        if (failStep) {
+          if (isSubWorkflowStep(failStep)) {
+            recordStepStart(instId, failStep.id, "do");
+            logEvent(instId, "info", "step_start", { step: failStep.id, phase: "do" });
+            pushState({ ...parentState, current_step: failStep.id, current_phase: "do", fail_count: parentFailCount, last_failure_reason: checkResult.reason }, instId);
+            const subResult = resolveSubWorkflowEntry(instId, failStep.workflow, parentState.user_task, failStep, MAX_NESTING_DEPTH, checkResult.reason, parentFailCount);
+            if (subResult.error) {
+              popState(instId);
+              writeState({ ...parentState, fail_count: parentFailCount, paused: true, pause_reason: "config_error", last_failure_reason: subResult.text }, instId);
+              return { text: subResult.text, paused: true };
+            }
+            return {
+              text: `## 检查结果：失败 ✗ (${newFailCount}/${step.max_fail_count})\n\n${checkResult.reason || "检查失败。"}\n\n---\n\n子工作流失败。使用父步骤重试：**${failStep.id}**\n\n---\n\n${subResult.text}`,
+            };
+          }
+          const retryState = { ...parentState, current_step: failStep.id, current_phase: "do", fail_count: parentFailCount, last_failure_reason: checkResult.reason };
+          writeState(retryState, instId);
+          recordStepStart(instId, failStep.id, "do");
+          logEvent(instId, "info", "step_start", { step: failStep.id, phase: "do" });
+          return {
+            text: `## 检查结果：失败 ✗ (${newFailCount}/${step.max_fail_count})\n\n${checkResult.reason || "检查失败。"}\n\n---\n\n子工作流失败。使用父步骤重试：**${failStep.id}** - ${failStep.desc}\n\n---\n\n${buildDoPrompt(instId, failStep, parentState.user_task, checkResult.reason, parentFailCount)}`,
+          };
+        }
+        // on_fail step not found — pause, but push parent state back so resume can restore stack
+        pushState({ ...parentState, fail_count: parentFailCount, paused: true, pause_reason: "config_error", last_failure_reason: `父步骤 on_fail "${parentStep.on_fail}" 未找到。` }, instId);
+        writeState({ ...parentState, fail_count: parentFailCount, paused: true, pause_reason: "config_error", last_failure_reason: `父步骤 on_fail "${parentStep.on_fail}" 未找到。` }, instId);
+        return {
+          text: `## 检查结果：失败 ✗ (${newFailCount}/${step.max_fail_count})\n\n${checkResult.reason || "检查失败。"}\n\n---\n\n父步骤 on_fail "${parentStep.on_fail}" 未找到。工作流已暂停。`,
+          paused: true,
+        };
+      }
+      clearManualStepMarker(instId);
+      const pausedState = { ...state, fail_count: newFailCount, paused: true, pause_reason: "max_failures", last_failure_reason: checkResult.reason };
+      writeState(pausedState, instId);
+      logEvent(instId, "warn", "workflow_paused", { workflow: state.workflow_name, step: state.current_step, fail_count: newFailCount });
+      return {
+        text: `## 检查结果：失败 ✗ (${newFailCount}/${step.max_fail_count})\n\n${checkResult.reason || "检查失败。"}\n\n---\n\n## 工作流已暂停\n\n已达最大失败次数。请修复问题，然后调用 \`ralphflow_continue\` 恢复。`,
+        paused: true,
+      };
+    }
+
+    const failStep = getStep(workflow, step.on_fail);
+    if (!failStep) {
+      const pausedState = { ...state, fail_count: newFailCount, paused: true, pause_reason: "config_error", last_failure_reason: `失败步骤 "${step.on_fail}" 在工作流定义中未找到。` };
+      writeState(pausedState, instId);
+      logEvent(instId, "error", "fail_step_not_found", { step: state.current_step, on_fail: step.on_fail });
+      return {
+        text: `## 检查结果：失败 ✗ (${newFailCount}/${step.max_fail_count})\n\n失败步骤 "${step.on_fail}" 在工作流定义中未找到。\n\n---\n\n## 工作流已暂停\n\n工作流配置错误。请修复工作流定义，然后调用 \`ralphflow_continue\` 恢复。`,
+        paused: true,
+      };
+    }
+
+    if (isSubWorkflowStep(failStep)) {
+      recordStepStart(instId, failStep.id, "do");
+      logEvent(instId, "info", "step_start", { step: failStep.id, phase: "do" });
+      // Always use newFailCount (never reset on routing to different step)
+      pushState({ ...state, current_step: failStep.id, current_phase: "do", fail_count: newFailCount, last_failure_reason: checkResult.reason }, instId);
+      const subResult = resolveSubWorkflowEntry(instId, failStep.workflow, state.user_task, failStep, MAX_NESTING_DEPTH, checkResult.reason, newFailCount);
+      if (subResult.error) {
+        popState(instId);
+        writeState({ ...state, fail_count: newFailCount, paused: true, pause_reason: "config_error", last_failure_reason: subResult.text }, instId);
+        return { text: subResult.text, paused: true };
+      }
+      return {
+        text: `## 检查结果：失败 ✗ (${newFailCount}/${step.max_fail_count})\n\n${checkResult.reason || "检查失败。"}\n\n---\n\n使用子工作流重试：**${failStep.id}**\n\n---\n\n${subResult.text}`,
+      };
+    }
+
+    // Always use newFailCount (never reset on routing to different step)
+    const retryState = { ...state, current_step: failStep.id, current_phase: "do", fail_count: newFailCount, last_failure_reason: checkResult.reason };
+    writeState(retryState, instId);
+    recordStepStart(instId, failStep.id, "do");
+    logEvent(instId, "info", "step_start", { step: failStep.id, phase: "do" });
+    return {
+      text: `## 检查结果：失败 ✗ (${newFailCount}/${step.max_fail_count})\n\n${checkResult.reason || "检查失败。"}\n\n---\n\n重试：**${failStep.id}** - ${failStep.desc}\n\n---\n\n${buildDoPrompt(instId, failStep, state.user_task, checkResult.reason, newFailCount)}`,
+    };
+  }
+
+  // ─── Step Records (per instance, file-backed) ───────────────────────────────
+
+  // Ephemeral start times keyed by instId:stepId:phase (only used to compute a
+  // record's duration when addStepRecord fires).
+  const stepStartTimes = new Map<string, string>();
+
+  function recordStepStart(instId: string, stepId: string, phase: string): void {
+    stepStartTimes.set(`${instId}:${stepId}:${phase}`, new Date().toISOString());
+  }
+
+  function addStepRecord(instId: string, stepId: string, phase: string, status: "passed" | "failed", failCount: number, reason?: string): void {
+    const now = new Date().toISOString();
+    const key = `${instId}:${stepId}:${phase}`;
+    const startTime = stepStartTimes.get(key) || now;
+    stepStartTimes.delete(key);
+    const records = loadStepRecords(instId);
+    records.push({ stepId, phase, status, failCount: failCount || 0, startTime, endTime: now, reason });
+    saveStepRecords(instId, records.length > MAX_STEP_RECORDS ? records.slice(-MAX_STEP_RECORDS) : records);
+  }
+
+  function ensureProjectWorkflows(): void {
+    // Ensure the project AND global user workflow dirs exist as places for the
+    // user to drop *custom* workflows. Built-in workflows are intentionally NOT
+    // copied into either: loadWorkflow falls back to the package dir, so
+    // built-ins always resolve to the latest shipped version. Seeding copies
+    // would shadow the package dir and go stale on updates. The global dir
+    // matters most for global installs, where the package itself is a managed,
+    // non-editable location.
+    for (const dir of [getProjectWorkflowsDir(), getGlobalWorkflowsDir()]) {
+      if (!dir) continue;
+      try {
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      } catch (e: any) {
+        diag("[ralph-flow] Error initializing workflows dir:", dir, e.message);
+      }
+    }
+  }
+
+  return {
+    projectDir,
+    diag,
+    setAbortActiveStep,
+    // paths
+    getRalphFlowDir, getInstancesRoot, getReportsDir, getInstanceDir, instPath,
+    getArtifactsDir, getArtifactsRelDir, getBuiltinWorkflowsDir, getProjectWorkflowsDir,
+    getGlobalWorkflowsDir, getGlobalConfigHome,
+    getSessionsDir, getStepSessionDir, listStepSessionDirs,
+    // instance infra
+    generateInstanceId, isValidInstanceId, instanceExists,
+    writeArtifactsDirName, writeExtraDirs, readExtraDirs,
+    readOwnerSession, claimOwnership,
+    listInstances, resolveInstance, bindInstance, destroyInstance,
+    instanceStatusLabel, formatInstanceList, formatLastActivity,
+    // runner pid
+    writeRunnerPid, clearRunnerPid, readRunnerPid, foreignRunnerPid,
+    // state + markers
+    readState, writeState, isValidState,
+    writeMarker, clearMarker, markerExists,
+    writeManualStepMarker, clearManualStepMarker, writeManualGate, clearManualGate,
+    clearReinjectCounter, clearDoPromptCache,
+    writeDoneReported, clearDoneReported, doneReported,
+    readReinjectCount, incrementReinjectCount,
+    writeDoPromptCache, readDoPromptCache,
+    writeAdversarialSession, clearAdversarialSession, readAdversarialSession,
+    // workflows
+    parseWorkflowFile, loadWorkflow, listWorkflows, lintWorkflow, buildDoctorReport,
+    isValidWorkflowName,
+    // steps + prompts
+    getStep, buildDoPrompt, buildCheckPrompt, buildSubWorkflowUserTask,
+    resolveSubWorkflowEntry, renderStepText,
+    // stack
+    pushState, popState, getStackDepth,
+    // logs + records
+    logEvent, recordStepStart, addStepRecord, loadStepRecords,
+    // reports
+    buildReportText, archiveReport,
+    // transitions
+    handleCheckPassed, handleCheckFailed,
+    // startup
+    ensureProjectWorkflows,
+  };
+}
+
+/** Liveness probe used by the runner-pid guard and the instance lock. */
+export function isPidAlive(pid: number): boolean {
+  try {
+    // Signal 0 performs error checking without actually sending a signal.
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    // EPERM means the process exists but belongs to another user.
+    return e.code === "EPERM";
+  }
+}
+
+// ─── Adversarial check defaults (shared with check.ts) ──────────────────────
+//
+// Mirrors the plugin versions' DEFAULT_ADVERSARIAL_SYSTEM_PROMPT verbatim except
+// the output-format section: the verdict is a tool call here, not a text tag.
+
+export const DEFAULT_ADVERSARIAL_SYSTEM_PROMPT = `你是一个严格的检查者。你的职责是根据检查依据判断任务是否完成。
+
+## 核心原则
+
+1. 只审查，不修改
+2. 严格按照"检查依据"判断，不要被其他因素干扰
+3. 如果有任何疑问，判定为不通过
+
+## 验证方法
+
+你必须**自主探索**项目来验证任务是否完成：
+- 根据任务类型，选择合适的验证方式
+- 基于检查依据中的要求，逐一验证每一项
+- 不要依赖任何外部提供的"实现总结"，只基于你自己的验证结果判断
+
+## 判断逻辑
+
+**通过条件**：检查依据中的每一项都满足
+**不通过条件**：检查依据中任何一项不满足
+
+## 提交结论
+
+检查完成后**必须调用 \`verdict\` 工具**提交结论：
+- 通过：\`verdict(pass=true, reason="<通过的具体原因>")\`
+- 不通过：\`verdict(pass=false, reason="<失败的具体原因>")\`
+
+reason 要具体（引用你实际看到的文件内容、命令输出），不要只写"符合要求"。`;
+
+export const DEFAULT_ADVERSARIAL_TIMEOUT_MS = 900_000;
+
+/** Cap for the verdict reason carried into state.last_failure_reason. */
+export const MAX_CHECK_REASON_LENGTH = 5000;
+
+export function truncateCheckReason(reason: string): string {
+  const r = String(reason || "").trim();
+  return r.length > MAX_CHECK_REASON_LENGTH ? r.substring(0, MAX_CHECK_REASON_LENGTH) + "..." : r;
+}
+
+// ─── Read-only verifier permissions ──────────────────────────────────────────
+//
+// The Claude plugin runs the checker as `claude -p --allowedTools "…"`; the
+// opencode plugin uses an agent permission map. Both express the same ALLOW-list:
+// read-only file/text tools + a curated set of non-mutating Bash subcommands
+// (never rm/mv/cargo-fix/plain-fmt). ralph-flow-pi has no agent or host
+// permission layer to lean on — check-bash.ts enforces this table itself before
+// executing anything, which is why the verifier cannot mutate the workspace it
+// is judging.
+//
+// Patterns use the trailing-space form ("cat *") so short names can't overmatch
+// a mutating command (e.g. a bare "tr*" would also match "truncate"). Bare
+// forms are added only for the handful of commands checks commonly run without
+// arguments.
+export const RALPH_CHECK_BASH_PERMISSION: Record<string, PermissionAction> = {
+  "*": "deny",
+  // Inspection / read-only file + text tools.
+  "cat *": "allow", "head *": "allow", "tail *": "allow", "ls *": "allow",
+  "find *": "allow", "grep *": "allow", "wc *": "allow", "file *": "allow", "stat *": "allow",
+  "awk *": "allow", "sed *": "allow", "cut *": "allow", "sort *": "allow", "uniq *": "allow",
+  "tr *": "allow", "cd *": "allow", "xargs *": "allow",
+  // Read-only text / arithmetic / structured-data helpers used by check scripts.
+  "jq *": "allow", "bc *": "allow", "echo *": "allow", "printf *": "allow",
+  "test *": "allow", "true": "allow", "true *": "allow",
+  "diff *": "allow", "cmp *": "allow", "comm *": "allow", "basename *": "allow",
+  "dirname *": "allow", "realpath *": "allow", "readlink *": "allow", "pwd": "allow", "pwd *": "allow",
+  "nm *": "allow",
+  // Git inspection (never mutating).
+  "git status": "allow", "git status *": "allow", "git diff": "allow", "git diff *": "allow",
+  "git log": "allow", "git log *": "allow", "git show *": "allow",
+  // Test runners.
+  "npm test": "allow", "npm test *": "allow", "npm run test *": "allow",
+  "pytest": "allow", "pytest *": "allow", "go test *": "allow", "make test": "allow", "make test *": "allow",
+  // Cargo verification — build/test/run only touch target/, never source.
+  // `cargo fmt` is allowed ONLY with --check (plain fmt rewrites source).
+  "cargo build": "allow", "cargo build *": "allow", "cargo test": "allow", "cargo test *": "allow",
+  "cargo run *": "allow", "cargo nextest *": "allow", "cargo clippy": "allow", "cargo clippy *": "allow",
+  "cargo llvm-cov *": "allow", "cargo geiger *": "allow", "cargo clean *": "allow",
+  "cargo fmt --check*": "allow", "cargo metadata *": "allow", "cargo tree *": "allow",
+  "cargo audit *": "allow", "cargo deny *": "allow",
+};
