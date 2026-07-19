@@ -29,6 +29,7 @@
 
 - [Node.js](https://nodejs.org/) 20+
 - 一个 Pi SDK 支持的模型账号或 API key（Anthropic / OpenAI / Gemini 等都行，见下面「配置模型凭据」）
+- **macOS 或 Linux**。本工具基于 [Pi SDK](https://github.com/earendil-works/pi)，Pi 在 Windows 上支持较差（WSL 下可以正常运行）
 
 ### 安装
 
@@ -383,6 +384,10 @@ npm ls -g --depth=0 | grep ralph-flow-pi
 **模型没反应 / 提示凭据错误**
 
 确认 `/login` 走完了流程，或者对应 provider 的环境变量（如 `ANTHROPIC_API_KEY`）已经设置。
+
+**Windows 上运行报错**
+
+Pi SDK 对 Windows 原生支持有限，推荐在 WSL2 中安装使用。在 WSL 终端里执行 `npm install -g ralph-flow-pi` 即可。
 
 **Esc 退出后忘了怎么回去看进度**
 
