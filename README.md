@@ -7,7 +7,7 @@
 **让 AI 自己把任务做完、自己验证、失败了自己重试 —— 不用你盯着，也不用你反复复制粘贴报错信息。**
 
 命令行工具，基于 [Pi SDK](https://github.com/earendil-works/pi) 构建，是 [ralph-flow](https://github.com/534529531/ralph-flow)（opencode 插件版）的独立 CLI 重写。
-<img width="3838" height="2160" alt="Screenshot from 2026-07-18 23-31-43" src="https://github.com/user-attachments/assets/a454e614-47e6-4b72-9739-fd423dd2f741" />
+<img width="3840" height="2159" alt="Screenshot from 2026-07-20 00-01-12" src="https://github.com/user-attachments/assets/d7fa707f-065f-49e5-9f4e-d500de0fe892" />
 
 <img width="3840" height="2159" alt="Screenshot from 2026-07-18 23-31-02" src="https://github.com/user-attachments/assets/19637238-de26-40bb-a36c-10ef1b40f00f" />
 
